@@ -137,18 +137,25 @@ export class SdrfApiValidatorService {
     const { skipOntology = true, useOlsCacheOnly = true } = options;
 
     try {
-      // Build query parameters
+      // Build query parameters (no content - sent via FormData)
       const params = new URLSearchParams();
-      params.append('content', sdrfTsv);
       templates.forEach(t => params.append('template', t));
       params.append('skip_ontology', String(skipOntology));
       params.append('use_ols_cache_only', String(useOlsCacheOnly));
 
-      const response = await fetch(`${API_BASE_URL}/validate/text?${params.toString()}`, {
+      // Convert text content to a File blob for multipart upload
+      const blob = new Blob([sdrfTsv], { type: 'text/tab-separated-values' });
+      const file = new File([blob], 'sdrf.tsv', { type: 'text/tab-separated-values' });
+
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const response = await fetch(`${API_BASE_URL}/validate?${params.toString()}`, {
         method: 'POST',
         headers: {
           'Accept': 'application/json',
         },
+        body: formData,
       });
 
       if (!response.ok) {

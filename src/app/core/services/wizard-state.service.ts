@@ -366,7 +366,31 @@ export class WizardStateService {
    * Set all samples at once.
    */
   setSamples(samples: WizardSampleEntry[]): void {
-    this._state.update(s => ({ ...s, samples }));
+    this._state.update(s => ({ ...s, samples, sampleCount: samples.length }));
+  }
+
+  /**
+   * Add a new sample at the end.
+   */
+  addSample(): void {
+    this._state.update(s => {
+      const newIndex = s.samples.length > 0
+        ? Math.max(...s.samples.map(sample => sample.index)) + 1
+        : 1;
+      const samples = [...s.samples, createDefaultSample(newIndex)];
+      return { ...s, samples, sampleCount: samples.length };
+    });
+  }
+
+  /**
+   * Remove a sample by array index.
+   */
+  removeSample(index: number): void {
+    this._state.update(s => {
+      if (s.samples.length <= 1) return s; // Keep at least one sample
+      const samples = s.samples.filter((_, i) => i !== index);
+      return { ...s, samples, sampleCount: samples.length };
+    });
   }
 
   /**
