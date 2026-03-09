@@ -17,6 +17,7 @@ import { SdrfEditorComponent } from './components/sdrf-editor/sdrf-editor.compon
       <main class="app-main">
         <sdrf-editor-table
           [url]="activeUrl"
+          [content]="activeContent"
           [exampleUrl]="exampleUrl"
           (tableChange)="onTableChange($event)"
           (validationComplete)="onValidation($event)"
@@ -48,6 +49,7 @@ import { SdrfEditorComponent } from './components/sdrf-editor/sdrf-editor.compon
 })
 export class AppComponent implements OnInit {
   activeUrl = '';
+  activeContent = '';
 
   // Example SDRF from proteomics-metadata-standard
   readonly exampleUrl = 'https://raw.githubusercontent.com/bigbio/proteomics-metadata-standard/master/annotated-projects/PXD000070/PXD000070.sdrf.tsv';
@@ -58,6 +60,15 @@ export class AppComponent implements OnInit {
     const urlParam = urlParams.get('url');
     if (urlParam) {
       this.activeUrl = urlParam;
+    }
+    // Check for content parameter (base64-encoded TSV from Template Builder)
+    const contentParam = urlParams.get('content');
+    if (contentParam) {
+      try {
+        this.activeContent = atob(contentParam);
+      } catch {
+        console.error('Failed to decode content parameter');
+      }
     }
   }
 
