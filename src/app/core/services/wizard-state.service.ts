@@ -21,6 +21,8 @@ import {
   isHumanTemplate,
   isCellLineTemplate,
   isVertebrateTemplate,
+  isInvertebrateTemplate,
+  isPlantTemplate,
 } from '../models/wizard';
 
 @Injectable({ providedIn: 'root' })
@@ -346,6 +348,19 @@ export class WizardStateService {
 
   /** Check if current template is vertebrate */
   readonly isVertebrateTemplate = computed(() => isVertebrateTemplate(this._state().template));
+
+  /** Check if current template is invertebrate */
+  readonly isInvertebrateTemplate = computed(() => isInvertebrateTemplate(this._state().template));
+
+  /** Check if current template is plant */
+  readonly isPlantTemplate = computed(() => isPlantTemplate(this._state().template));
+
+  /** Check if current template needs strain/breed and developmental stage fields */
+  readonly needsStrainAndDevelopmentalStage = computed(() =>
+    isVertebrateTemplate(this._state().template) ||
+    isInvertebrateTemplate(this._state().template) ||
+    isPlantTemplate(this._state().template)
+  );
 
   // ============ Step 3: Sample Values ============
 

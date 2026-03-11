@@ -66,11 +66,32 @@ export const WIZARD_TEMPLATES: TemplateInfo[] = [
     examples: ['Mouse liver', 'Rat brain', 'Zebrafish embryo'],
   },
   {
+    id: 'invertebrates',
+    name: 'Invertebrates',
+    description: 'Drosophila, C. elegans, insects, and other invertebrates',
+    icon: 'bug_report',
+    examples: ['Drosophila', 'C. elegans', 'Insects'],
+  },
+  {
+    id: 'plants',
+    name: 'Plants',
+    description: 'Arabidopsis, crops, and other plant samples',
+    icon: 'eco',
+    examples: ['Arabidopsis', 'Rice', 'Wheat'],
+  },
+  {
     id: 'ms-proteomics',
     name: 'MS Proteomics',
     description: 'Mass spectrometry-based proteomics experiments',
     icon: 'analytics',
     examples: ['DDA', 'DIA', 'PRM', 'SRM'],
+  },
+  {
+    id: 'affinity-proteomics',
+    name: 'Affinity-based Proteomics',
+    description: 'Protein-level assays (Olink, SomaScan)',
+    icon: 'biotech',
+    examples: ['Olink', 'SomaScan', 'Protein arrays'],
   },
 ];
 
@@ -93,6 +114,20 @@ export function isCellLineTemplate(templateId: string | null): boolean {
  */
 export function isVertebrateTemplate(templateId: string | null): boolean {
   return templateId === 'vertebrate' || templateId === 'vertebrates';
+}
+
+/**
+ * Check if template is an invertebrate template.
+ */
+export function isInvertebrateTemplate(templateId: string | null): boolean {
+  return templateId === 'invertebrates';
+}
+
+/**
+ * Check if template is a plant template.
+ */
+export function isPlantTemplate(templateId: string | null): boolean {
+  return templateId === 'plants';
 }
 
 // ============ Ontology Term ============
