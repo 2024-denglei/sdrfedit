@@ -176,7 +176,7 @@ const GITHUB_RAW_BASE = 'https://raw.githubusercontent.com/bigbio/sdrf-templates
 const API_BASE_URL = 'https://www.ebi.ac.uk/pride/services/sdrf-validator';
 
 // Default templates to show in wizard
-const DEFAULT_WIZARD_TEMPLATES = ['human', 'cell-lines', 'vertebrates', 'ms-proteomics'];
+const DEFAULT_WIZARD_TEMPLATES = ['human', 'cell-lines', 'vertebrates', 'invertebrates', 'plants', 'ms-proteomics', 'affinity-proteomics'];
 
 // Cache TTL in milliseconds (5 minutes)
 const CACHE_TTL = 5 * 60 * 1000;
@@ -347,12 +347,12 @@ export class TemplateService {
    * Load fallback templates when fetch fails.
    */
   private async loadFallbackTemplates(): Promise<void> {
-    // Create minimal fallback templates based on the old hard-coded ones
+    // Create minimal fallback templates based on the template hierarchy
     const fallbackTemplates: TemplateDefinition[] = [
       {
         name: 'human',
         description: 'Human Samples',
-        version: '1.0.0',
+        version: '1.1.0',
         extends: null,
         usableAlone: true,
         layer: 'sample',
@@ -361,16 +361,34 @@ export class TemplateService {
       {
         name: 'cell-lines',
         description: 'Cell Lines',
-        version: '1.0.0',
+        version: '1.1.0',
+        extends: null,
+        usableAlone: true,
+        layer: 'experiment',
+        columns: this.getBaseColumns(),
+      },
+      {
+        name: 'vertebrates',
+        description: 'Vertebrates (Non-Human)',
+        version: '1.1.0',
         extends: null,
         usableAlone: true,
         layer: 'sample',
         columns: this.getBaseColumns(),
       },
       {
-        name: 'vertebrates',
-        description: 'Vertebrates (Non-Human)',
-        version: '1.0.0',
+        name: 'invertebrates',
+        description: 'Invertebrates',
+        version: '1.1.0',
+        extends: null,
+        usableAlone: true,
+        layer: 'sample',
+        columns: this.getBaseColumns(),
+      },
+      {
+        name: 'plants',
+        description: 'Plants',
+        version: '1.1.0',
         extends: null,
         usableAlone: true,
         layer: 'sample',
@@ -379,11 +397,20 @@ export class TemplateService {
       {
         name: 'ms-proteomics',
         description: 'MS Proteomics',
-        version: '1.0.0',
+        version: '1.1.0',
         extends: null,
         usableAlone: true,
         layer: 'technology',
         columns: this.getMsProteomicsColumns(),
+      },
+      {
+        name: 'affinity-proteomics',
+        description: 'Affinity-based Proteomics',
+        version: '1.0.0',
+        extends: null,
+        usableAlone: true,
+        layer: 'technology',
+        columns: this.getBaseColumns(),
       },
     ];
 

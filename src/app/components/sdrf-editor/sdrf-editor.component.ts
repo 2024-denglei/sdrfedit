@@ -469,7 +469,7 @@ const BUFFER_ROWS = 10;
                               <div class="error-suggestion">💡 {{ error.suggestion }}</div>
                             }
                           </div>
-                          <button class="btn btn-ai-assist" (click)="sendErrorToAI(error)" title="Ask AI for help">
+                          <button class="btn btn-ai-assist btn-disabled" disabled title="AI Assist - Coming soon">
                             AI Assist
                           </button>
                         </div>
@@ -1810,6 +1810,16 @@ const BUFFER_ROWS = 10;
       opacity: 0.9;
     }
 
+    .btn-ai-assist.btn-disabled {
+      background: #9ca3af;
+      cursor: not-allowed;
+      opacity: 0.7;
+    }
+
+    .btn-ai-assist.btn-disabled:hover {
+      opacity: 0.7;
+    }
+
     .validation-loading {
       display: flex;
       align-items: center;
@@ -2172,7 +2182,7 @@ export class SdrfEditorComponent implements OnInit, OnChanges, AfterViewInit, On
   @Input() readonly = false;
 
   /** Available templates for the creation wizard (defaults to common templates) */
-  @Input() availableWizardTemplates: string[] = ['human', 'cell-lines', 'vertebrates', 'ms-proteomics'];
+  @Input() availableWizardTemplates: string[] = ['human', 'cell-lines', 'vertebrates', 'invertebrates', 'plants', 'ms-proteomics', 'affinity-proteomics'];
 
   // ============ Outputs ============
 

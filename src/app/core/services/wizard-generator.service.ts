@@ -13,6 +13,8 @@ import {
   isHumanTemplate,
   isCellLineTemplate,
   isVertebrateTemplate,
+  isInvertebrateTemplate,
+  isPlantTemplate,
 } from '../models/wizard';
 import { SdrfTable, createEmptyTable } from '../models/sdrf-table';
 import { SdrfColumn, ColumnType, Modifier } from '../models/sdrf-column';
@@ -49,6 +51,24 @@ export class WizardGeneratorService {
     }
 
     if (isVertebrateTemplate(state.template)) {
+      if (state.strainBreed) {
+        table.columns.push(this.createStrainBreedColumn(state, columnPosition++));
+      }
+      if (state.developmentalStage) {
+        table.columns.push(this.createDevelopmentalStageColumn(state, columnPosition++));
+      }
+    }
+
+    if (isInvertebrateTemplate(state.template)) {
+      if (state.strainBreed) {
+        table.columns.push(this.createStrainBreedColumn(state, columnPosition++));
+      }
+      if (state.developmentalStage) {
+        table.columns.push(this.createDevelopmentalStageColumn(state, columnPosition++));
+      }
+    }
+
+    if (isPlantTemplate(state.template)) {
       if (state.strainBreed) {
         table.columns.push(this.createStrainBreedColumn(state, columnPosition++));
       }

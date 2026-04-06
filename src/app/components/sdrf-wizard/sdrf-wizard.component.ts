@@ -380,7 +380,7 @@ import { ReviewCreateComponent } from './steps/review-create.component';
 })
 export class SdrfWizardComponent implements OnInit {
   @Input() aiEnabled = false;
-  @Input() availableTemplates: string[] = ['human', 'cell-lines', 'vertebrates', 'ms-proteomics'];
+  @Input() availableTemplates: string[] = ['human', 'cell-lines', 'vertebrates', 'invertebrates', 'plants', 'ms-proteomics', 'affinity-proteomics'];
   @Output() complete = new EventEmitter<SdrfTable>();
   @Output() cancel = new EventEmitter<void>();
 

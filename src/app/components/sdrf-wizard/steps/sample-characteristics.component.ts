@@ -334,15 +334,15 @@ import { olsService, type DirectOlsService } from '../../../core/services/ols.se
         </div>
       }
 
-      @if (wizardState.isVertebrateTemplate()) {
+      @if (wizardState.needsStrainAndDevelopmentalStage()) {
         <div class="template-fields">
-          <h4>Vertebrate-specific Fields</h4>
+          <h4>Organism-specific Fields</h4>
 
           <div class="form-row">
             <div class="form-section">
               <label class="form-label">
                 Strain / Breed
-                <span class="help-text">For mice/rats (e.g., C57BL/6, Sprague-Dawley)</span>
+                <span class="help-text">e.g., C57BL/6 (mouse), Col-0 (Arabidopsis), Oregon-R (Drosophila)</span>
               </label>
               <input
                 type="text"

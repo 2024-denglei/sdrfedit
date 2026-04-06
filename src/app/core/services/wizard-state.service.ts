@@ -21,6 +21,8 @@ import {
   isHumanTemplate,
   isCellLineTemplate,
   isVertebrateTemplate,
+  isInvertebrateTemplate,
+  isPlantTemplate,
 } from '../models/wizard';
 
 @Injectable({ providedIn: 'root' })
@@ -347,6 +349,19 @@ export class WizardStateService {
   /** Check if current template is vertebrate */
   readonly isVertebrateTemplate = computed(() => isVertebrateTemplate(this._state().template));
 
+  /** Check if current template is invertebrate */
+  readonly isInvertebrateTemplate = computed(() => isInvertebrateTemplate(this._state().template));
+
+  /** Check if current template is plant */
+  readonly isPlantTemplate = computed(() => isPlantTemplate(this._state().template));
+
+  /** Check if current template needs strain/breed and developmental stage fields */
+  readonly needsStrainAndDevelopmentalStage = computed(() =>
+    isVertebrateTemplate(this._state().template) ||
+    isInvertebrateTemplate(this._state().template) ||
+    isPlantTemplate(this._state().template)
+  );
+
   // ============ Step 3: Sample Values ============
 
   /**
@@ -366,7 +381,31 @@ export class WizardStateService {
    * Set all samples at once.
    */
   setSamples(samples: WizardSampleEntry[]): void {
-    this._state.update(s => ({ ...s, samples }));
+    this._state.update(s => ({ ...s, samples, sampleCount: samples.length }));
+  }
+
+  /**
+   * Add a new sample at the end.
+   */
+  addSample(): void {
+    this._state.update(s => {
+      const newIndex = s.samples.length > 0
+        ? Math.max(...s.samples.map(sample => sample.index)) + 1
+        : 1;
+      const samples = [...s.samples, createDefaultSample(newIndex)];
+      return { ...s, samples, sampleCount: samples.length };
+    });
+  }
+
+  /**
+   * Remove a sample by array index.
+   */
+  removeSample(index: number): void {
+    this._state.update(s => {
+      if (s.samples.length <= 1) return s; // Keep at least one sample
+      const samples = s.samples.filter((_, i) => i !== index);
+      return { ...s, samples, sampleCount: samples.length };
+    });
   }
 
   /**

@@ -53,6 +53,12 @@ import { WizardSampleEntry } from '../../../core/models/wizard';
             Copy Bio. Rep. to all
           </button>
         </div>
+
+        <div class="toolbar-group toolbar-right">
+          <button class="toolbar-btn add-btn" (click)="addSample()">
+            + Add sample
+          </button>
+        </div>
       </div>
 
       <!-- Sample Table -->
@@ -72,6 +78,7 @@ import { WizardSampleEntry } from '../../../core/models/wizard';
               @if (showSexColumn()) {
                 <th class="col-sex">Sex</th>
               }
+              <th class="col-actions"></th>
             </tr>
           </thead>
           <tbody>
@@ -132,6 +139,16 @@ import { WizardSampleEntry } from '../../../core/models/wizard';
                     </select>
                   </td>
                 }
+                <td class="col-actions">
+                  <button
+                    class="remove-btn"
+                    (click)="removeSample(i)"
+                    [disabled]="wizardState.samples().length <= 1"
+                    title="Remove sample"
+                  >
+                    &times;
+                  </button>
+                </td>
               </tr>
             }
           </tbody>
@@ -420,6 +437,51 @@ import { WizardSampleEntry } from '../../../core/models/wizard';
       font-size: 12px;
       font-weight: bold;
     }
+
+    .toolbar-right {
+      margin-left: auto;
+    }
+
+    .add-btn {
+      background: #eff6ff !important;
+      border-color: #3b82f6 !important;
+      color: #2563eb !important;
+      font-weight: 500;
+    }
+
+    .add-btn:hover {
+      background: #dbeafe !important;
+      border-color: #2563eb !important;
+    }
+
+    .col-actions {
+      width: 40px;
+      text-align: center;
+    }
+
+    .remove-btn {
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      border: none;
+      border-radius: 4px;
+      background: transparent;
+      color: #9ca3af;
+      font-size: 16px;
+      line-height: 1;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .remove-btn:hover:not(:disabled) {
+      background: #fef2f2;
+      color: #ef4444;
+    }
+
+    .remove-btn:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
   `],
 })
 export class SampleValuesComponent implements OnInit {
@@ -459,6 +521,14 @@ export class SampleValuesComponent implements OnInit {
 
   copyFirstToAll(field: keyof WizardSampleEntry): void {
     this.wizardState.copyToAllSamples(field);
+  }
+
+  addSample(): void {
+    this.wizardState.addSample();
+  }
+
+  removeSample(index: number): void {
+    this.wizardState.removeSample(index);
   }
 
   uniqueBioReplicates(): number {

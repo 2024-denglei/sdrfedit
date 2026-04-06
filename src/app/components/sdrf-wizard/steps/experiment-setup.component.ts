@@ -533,7 +533,7 @@ import { TemplateInfo as DynamicTemplateInfo } from '../../../core/models/templa
 })
 export class ExperimentSetupComponent implements OnInit {
   @Input() aiEnabled = false;
-  @Input() availableTemplates: string[] = ['human', 'cell-lines', 'vertebrates', 'ms-proteomics'];
+  @Input() availableTemplates: string[] = ['human', 'cell-lines', 'vertebrates', 'invertebrates', 'plants', 'ms-proteomics', 'affinity-proteomics'];
 
   readonly wizardState = inject(WizardStateService);
   readonly templateService = inject(TemplateService);
@@ -588,9 +588,12 @@ export class ExperimentSetupComponent implements OnInit {
   private getStaticTemplateLayer(templateId: string): string {
     const layerMap: Record<string, string> = {
       'human': 'sample',
-      'cell-lines': 'sample',
+      'cell-lines': 'experiment',
       'vertebrates': 'sample',
+      'invertebrates': 'sample',
+      'plants': 'sample',
       'ms-proteomics': 'technology',
+      'affinity-proteomics': 'technology',
     };
     return layerMap[templateId] || 'sample';
   }
@@ -601,9 +604,10 @@ export class ExperimentSetupComponent implements OnInit {
       'human': ['Patient biopsies', 'Blood samples', 'Tumor tissues'],
       'cell-lines': ['HeLa cells', 'HEK293', 'MCF-7'],
       'vertebrates': ['Mouse liver', 'Rat brain', 'Zebrafish'],
-      'ms-proteomics': ['DDA', 'DIA', 'PRM', 'SRM'],
       'invertebrates': ['Drosophila', 'C. elegans', 'Insects'],
       'plants': ['Arabidopsis', 'Rice', 'Wheat'],
+      'ms-proteomics': ['DDA', 'DIA', 'PRM', 'SRM'],
+      'affinity-proteomics': ['Olink', 'SomaScan', 'Protein arrays'],
     };
     return exampleMap[templateId] || [];
   }
@@ -645,7 +649,10 @@ export class ExperimentSetupComponent implements OnInit {
       case 'cell-lines': return '\ud83e\uddeb';
       case 'vertebrate':
       case 'vertebrates': return '\ud83d\udc2d';
+      case 'invertebrates': return '\ud83e\udeb2';
+      case 'plants': return '\ud83c\udf31';
       case 'ms-proteomics': return '\ud83d\udcca';
+      case 'affinity-proteomics': return '\ud83e\uddea';
       case 'other': return '\ud83e\uddec';
       default: return '\u2753';
     }
