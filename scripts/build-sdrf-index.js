@@ -326,7 +326,7 @@ function getPaths() {
     console.error('  node scripts/build-sdrf-index.js <path1> [path2] ...');
     console.error('  node scripts/build-sdrf-index.js --config ./paths.json\n');
     console.error('Example:');
-    console.error('  node scripts/build-sdrf-index.js ../proteomics-metadata-standard/annotated-projects');
+    console.error('  node scripts/build-sdrf-index.js ../sdrf-annotated-datasets/datasets');
     process.exit(1);
   }
 
