@@ -194,9 +194,9 @@ If you have a collection of annotated SDRF files, you can build a local knowledg
 # Provide paths to directories containing .sdrf.tsv files
 node scripts/build-sdrf-index.js /path/to/your/sdrf-files /another/path
 
-# Or use the public proteomics-metadata-standard repository
-git clone https://github.com/bigbio/proteomics-metadata-standard.git
-node scripts/build-sdrf-index.js ./proteomics-metadata-standard/annotated-projects
+# Or use the public bigbio/sdrf-annotated-datasets repository
+git clone https://github.com/bigbio/sdrf-annotated-datasets.git
+node scripts/build-sdrf-index.js ./sdrf-annotated-datasets/datasets
 ```
 
 ### Using a Config File
@@ -206,7 +206,7 @@ For repeated builds, create a config file:
 ```json
 {
   "paths": [
-    "../proteomics-metadata-standard/annotated-projects",
+    "../sdrf-annotated-datasets/datasets",
     "./my-local-sdrf-collection"
   ]
 }
