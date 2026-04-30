@@ -2,6 +2,7 @@
  * SDRF API Validator Service
  *
  * Provides SDRF validation using the EBI PRIDE SDRF Validator API.
+ * This is used as a fallback when Pyodide-based validation fails.
  *
  * API Documentation: https://www.ebi.ac.uk/pride/services/sdrf-validator/docs
  */
@@ -14,8 +15,7 @@ import { ValidationError } from './pyodide-validator.service';
  */
 export interface ApiValidationError {
   message: string;
-  type?: string;
-  error_type?: string;
+  error_type: string;
   row?: number;
   column?: string;
   value?: string;
@@ -60,20 +60,6 @@ export interface ApiHealthResponse {
 }
 
 const API_BASE_URL = 'https://www.ebi.ac.uk/pride/services/sdrf-validator';
-const DEFAULT_TEMPLATES = [
-  'ms-proteomics',
-  'human',
-  'vertebrates',
-  'invertebrates',
-  'plants',
-  'cell-lines',
-];
-const TEMPLATE_ALIASES: Record<string, string> = {
-  default: 'ms-proteomics',
-  'cell_lines': 'cell-lines',
-  'cell-line': 'cell-lines',
-  'nonvertebrates': 'invertebrates',
-};
 
 export class SdrfApiValidatorService {
   readonly isAvailable = signal<boolean | null>(null);
@@ -126,13 +112,12 @@ export class SdrfApiValidatorService {
       }
 
       const result: ApiTemplatesResponse = await response.json();
-      const canonicalTemplates = result.templates.map((template) =>
-        this.normalizeTemplateName(template.name)
-      );
-      return Array.from(new Set(canonicalTemplates));
+      // Extract just the template names from the objects
+      return result.templates.map(t => t.name);
     } catch (error) {
       console.warn('Failed to get templates from API:', error);
-      return DEFAULT_TEMPLATES;
+      // Return default templates
+      return ['default', 'human', 'vertebrates', 'nonvertebrates', 'plants', 'cell_lines'];
     }
   }
 
@@ -150,12 +135,11 @@ export class SdrfApiValidatorService {
     options: { skipOntology?: boolean; useOlsCacheOnly?: boolean } = {}
   ): Promise<ValidationError[]> {
     const { skipOntology = true, useOlsCacheOnly = true } = options;
-    const normalizedTemplates = this.normalizeTemplates(templates);
 
     try {
       // Build query parameters (no content - sent via FormData)
       const params = new URLSearchParams();
-      normalizedTemplates.forEach(t => params.append('template', t));
+      templates.forEach(t => params.append('template', t));
       params.append('skip_ontology', String(skipOntology));
       params.append('use_ols_cache_only', String(useOlsCacheOnly));
 
@@ -207,12 +191,11 @@ export class SdrfApiValidatorService {
     options: { skipOntology?: boolean; useOlsCacheOnly?: boolean } = {}
   ): Promise<ValidationError[]> {
     const { skipOntology = true, useOlsCacheOnly = true } = options;
-    const normalizedTemplates = this.normalizeTemplates(templates);
 
     try {
       // Build query parameters
       const params = new URLSearchParams();
-      normalizedTemplates.forEach(t => params.append('template', t));
+      templates.forEach(t => params.append('template', t));
       params.append('skip_ontology', String(skipOntology));
       params.append('use_ols_cache_only', String(useOlsCacheOnly));
 
@@ -268,7 +251,7 @@ export class SdrfApiValidatorService {
    * Generate a suggestion based on the error type
    */
   private generateSuggestion(error: ApiValidationError): string | null {
-    const errorType = (error.error_type || error.type || '').toLowerCase();
+    const errorType = error.error_type?.toLowerCase() || '';
     const message = error.message?.toLowerCase() || '';
 
     // Common error patterns and suggestions
@@ -296,17 +279,6 @@ export class SdrfApiValidatorService {
     }
 
     return null;
-  }
-
-  private normalizeTemplates(templates: string[]): string[] {
-    const canonicalTemplates = templates.map((template) =>
-      this.normalizeTemplateName(template)
-    );
-    return Array.from(new Set(canonicalTemplates));
-  }
-
-  private normalizeTemplateName(templateName: string): string {
-    return TEMPLATE_ALIASES[templateName] || templateName;
   }
 }
 

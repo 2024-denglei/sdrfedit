@@ -47,7 +47,6 @@ import { SdrfRecommendation } from '../../core/models/llm';
 import {
   PyodideValidatorService,
   pyodideValidatorService,
-  ValidationBackendMode,
   ValidationError,
 } from '../../core/services/pyodide-validator.service';
 import { sdrfExport } from '../../core/services/sdrf-export.service';
@@ -361,19 +360,17 @@ const BUFFER_ROWS = 10;
             <button class="btn btn-small" (click)="jumpToRow()">Go</button>
           </div>
 
-          <!-- Validation Panel -->
+          <!-- Validation Panel (Pyodide-based) -->
           @if (showValidationPanel()) {
             <div class="validation-panel-container">
               <div class="validation-panel-header">
                 <div class="validation-title">
                   <h3>SDRF Validation</h3>
-                  @if (validationMode() === 'api' && pyodideState() === 'loading') {
-                    <span class="pyodide-status loading">{{ pyodideLoadProgress() }}</span>
-                  } @else if (validationMode() === 'api' && usingApiFallback()) {
+                  @if (usingApiFallback()) {
                     <span class="pyodide-status api-fallback" title="Using EBI PRIDE SDRF Validator API">API</span>
-                  } @else if (validationMode() === 'local' && pyodideState() === 'loading') {
+                  } @else if (pyodideState() === 'loading') {
                     <span class="pyodide-status loading">{{ pyodideLoadProgress() }}</span>
-                  } @else if (validationMode() === 'local' && pyodideState() === 'ready') {
+                  } @else if (pyodideState() === 'ready') {
                     <span class="pyodide-status ready">Ready</span>
                   } @else if (pyodideState() === 'error') {
                     <span class="pyodide-status error">Error</span>
@@ -383,35 +380,6 @@ const BUFFER_ROWS = 10;
               </div>
 
               <div class="validation-panel-body">
-                <div class="validation-backend-row">
-                  <span class="template-label">Backend:</span>
-                  <label class="backend-option" [class.selected]="validationMode() === 'api'">
-                    <input
-                      type="radio"
-                      name="validation-backend"
-                      [checked]="validationMode() === 'api'"
-                      (change)="switchValidationMode('api')"
-                    />
-                    PRIDE API
-                  </label>
-                  <label class="backend-option" [class.selected]="validationMode() === 'local'">
-                    <input
-                      type="radio"
-                      name="validation-backend"
-                      [checked]="validationMode() === 'local'"
-                      (change)="switchValidationMode('local')"
-                    />
-                    Local browser
-                  </label>
-                  <span class="validation-backend-hint">
-                    @if (validationMode() === 'api') {
-                      Sends the current SDRF to PRIDE's deployed validator service.
-                    } @else {
-                      Runs the local sdrf-pipelines validator in the browser and keeps the SDRF on this device.
-                    }
-                  </span>
-                </div>
-
                 <!-- Template Selector: only show templates from library/API when loaded -->
                 <div class="template-selector-row">
                   <span class="template-label">Templates:</span>
@@ -430,10 +398,8 @@ const BUFFER_ROWS = 10;
                     </div>
                   } @else if (pyodideState() === 'loading') {
                     <span class="template-loading">Loading templates...</span>
-                  } @else if (validationMode() === 'local' && pyodideState() === 'not-loaded') {
-                    <span class="template-loading">Load the local validator to see templates</span>
-                  } @else if (validationMode() === 'api' && !usingApiFallback()) {
-                    <span class="template-loading">Connect to the PRIDE API to load templates</span>
+                  } @else if (pyodideState() === 'not-loaded') {
+                    <span class="template-loading">Load validator to see templates</span>
                   } @else if (pyodideState() === 'error') {
                     <span class="template-loading">Templates unavailable</span>
                   } @else {
@@ -446,12 +412,12 @@ const BUFFER_ROWS = 10;
                   >
                     @if (pyodideValidating()) {
                       <span class="spinner-sm"></span> Validating...
-                    } @else if (validationMode() === 'api') {
-                      Validate via API
+                    } @else if (usingApiFallback()) {
+                      Validate (API)
                     } @else if (pyodideState() === 'not-loaded') {
-                      Load Local Validator & Validate
+                      Load & Validate
                     } @else {
-                      Validate Locally
+                      Validate
                     }
                   </button>
                 </div>
@@ -1623,43 +1589,6 @@ const BUFFER_ROWS = 10;
       flex: 1;
     }
 
-    .validation-backend-row {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-bottom: 12px;
-      flex-wrap: wrap;
-    }
-
-    .backend-option {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      background: white;
-      border: 1px solid #d1d5db;
-      border-radius: 16px;
-      font-size: 12px;
-      cursor: pointer;
-      transition: all 0.2s;
-    }
-
-    .backend-option.selected {
-      background: #e0f2fe;
-      border-color: #0284c7;
-      color: #0f4c81;
-    }
-
-    .backend-option input {
-      margin: 0;
-    }
-
-    .validation-backend-hint {
-      font-size: 12px;
-      color: #4b5563;
-      flex: 1 1 320px;
-    }
-
     .template-selector-row {
       display: flex;
       align-items: center;
@@ -2372,9 +2301,6 @@ export class SdrfEditorComponent implements OnInit, OnChanges, AfterViewInit, On
   /** Selected templates for validation */
   selectedTemplates = signal<string[]>(['ms-proteomics']);
 
-  /** Active validation backend */
-  validationMode = signal<ValidationBackendMode>('api');
-
   /** Aggregated validation errors (grouped by message) */
   aggregatedErrors = computed(() => this.aggregateErrors(this.pyodideErrors()));
 
@@ -2621,14 +2547,11 @@ export class SdrfEditorComponent implements OnInit, OnChanges, AfterViewInit, On
   }
 
   /**
-   * Initialize the selected validation backend and load its templates.
+   * Initialize Pyodide runtime
    */
-  async initPyodide(mode: ValidationBackendMode = this.validationMode()): Promise<void> {
+  async initPyodide(): Promise<void> {
     try {
-      await this.pyodideService.initialize({
-        mode,
-        allowApiFallback: mode === 'auto',
-      });
+      await this.pyodideService.initialize();
 
       const available = this.pyodideAvailableTemplates();
       if (available.length === 0) return;
@@ -2646,37 +2569,19 @@ export class SdrfEditorComponent implements OnInit, OnChanges, AfterViewInit, On
         this.selectedTemplates.set(current.length > 0 ? current : [fallback]);
       }
     } catch (err) {
-      console.error('Failed to initialize validation backend:', err);
+      console.error('Failed to initialize Pyodide:', err);
     }
   }
 
   /**
-   * Switch between API-backed and local validation.
-   */
-  async switchValidationMode(mode: ValidationBackendMode): Promise<void> {
-    if (this.validationMode() === mode) {
-      return;
-    }
-
-    this.validationMode.set(mode);
-    this.pyodideErrors.set([]);
-    this.pyodideHasValidated.set(false);
-    await this.initPyodide(mode);
-  }
-
-  /**
-   * Run validation using the selected backend.
+   * Run Pyodide validation
    */
   async runPyodideValidation(): Promise<void> {
     if (!this.table() || this.pyodideValidating()) return;
-    const mode = this.validationMode();
 
-    // Initialize the selected backend if needed
-    if (
-      (mode === 'api' && !this.usingApiFallback()) ||
-      (mode === 'local' && this.pyodideState() !== 'ready')
-    ) {
-      await this.initPyodide(mode);
+    // Initialize Pyodide if not ready
+    if (!this.pyodideIsReady()) {
+      await this.initPyodide();
     }
 
     this.pyodideValidating.set(true);
@@ -2709,11 +2614,7 @@ export class SdrfEditorComponent implements OnInit, OnChanges, AfterViewInit, On
       const errors = await this.pyodideService.validate(
         tsvContent,
         templatesToUse,
-        {
-          skipOntology: true,
-          mode,
-          allowApiFallback: false,
-        }
+        { skipOntology: true }
       );
 
       this.pyodideErrors.set(errors);
