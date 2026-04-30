@@ -674,13 +674,13 @@ const BUFFER_ROWS = 10;
             <p class="footer-text">Supported by the proteomics community</p>
             <div class="partner-logos">
               <a href="https://eubic-ms.org/" target="_blank" class="partner-logo" title="EuBIC-MS">
-                <img src="assets/images/eubic-logo.png" alt="EuBIC-MS Logo" class="logo-image">
+                <img [src]="eubicLogoUrl" alt="EuBIC-MS Logo" class="logo-image">
               </a>
               <a href="https://psidev.info/" target="_blank" class="partner-logo" title="HUPO-PSI">
-                <img src="assets/images/psi-logo.png" alt="HUPO-PSI Logo" class="logo-image">
+                <img [src]="psiLogoUrl" alt="HUPO-PSI Logo" class="logo-image">
               </a>
               <a href="https://quantms.org/" target="_blank" class="partner-logo" title="QuantMS">
-                <img src="assets/images/quantms-logo.png" alt="QuantMS Logo" class="logo-image">
+                <img [src]="quantmsLogoUrl" alt="QuantMS Logo" class="logo-image">
               </a>
             </div>
           </div>
@@ -2283,6 +2283,11 @@ export class SdrfEditorComponent implements OnInit, OnChanges, AfterViewInit, On
 
   /** Current file name */
   fileName = signal('untitled.sdrf.tsv');
+
+  /** Asset URLs need to resolve relative to the loaded bundle for embedded deployments */
+  readonly eubicLogoUrl = new URL('assets/images/eubic-logo.png', import.meta.url).toString();
+  readonly psiLogoUrl = new URL('assets/images/psi-logo.png', import.meta.url).toString();
+  readonly quantmsLogoUrl = new URL('assets/images/quantms-logo.png', import.meta.url).toString();
 
   // ============ Pyodide Validation State ============
 
