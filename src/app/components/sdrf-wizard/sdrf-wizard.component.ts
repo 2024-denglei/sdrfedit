@@ -24,9 +24,9 @@ import { TemplateService } from '../../core/services/template.service';
 import { ExperimentSetupComponent } from './steps/experiment-setup.component';
 import { SampleCharacteristicsComponent } from './steps/sample-characteristics.component';
 import { SampleValuesComponent } from './steps/sample-values.component';
-import { TechnicalConfigComponent } from './steps/technical-config.component';
+import { RunsFilesComponent } from './steps/runs-files.component';
 import { InstrumentProtocolComponent } from './steps/instrument-protocol.component';
-import { DataFilesComponent } from './steps/data-files.component';
+import { FactorValuesComponent } from './steps/factor-values.component';
 import { ReviewCreateComponent } from './steps/review-create.component';
 
 @Component({
@@ -37,9 +37,9 @@ import { ReviewCreateComponent } from './steps/review-create.component';
     ExperimentSetupComponent,
     SampleCharacteristicsComponent,
     SampleValuesComponent,
-    TechnicalConfigComponent,
+    RunsFilesComponent,
     InstrumentProtocolComponent,
-    DataFilesComponent,
+    FactorValuesComponent,
     ReviewCreateComponent,
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -94,13 +94,13 @@ import { ReviewCreateComponent } from './steps/review-create.component';
               <wizard-sample-values [aiEnabled]="aiEnabled" />
             }
             @case (3) {
-              <wizard-technical-config [aiEnabled]="aiEnabled" />
+              <wizard-runs-files [aiEnabled]="aiEnabled" />
             }
             @case (4) {
               <wizard-instrument-protocol [aiEnabled]="aiEnabled" />
             }
             @case (5) {
-              <wizard-data-files [aiEnabled]="aiEnabled" />
+              <wizard-factor-values />
             }
             @case (6) {
               <wizard-review-create
@@ -380,7 +380,7 @@ import { ReviewCreateComponent } from './steps/review-create.component';
 })
 export class SdrfWizardComponent implements OnInit {
   @Input() aiEnabled = false;
-  @Input() availableTemplates: string[] = ['human', 'cell-lines', 'vertebrates', 'invertebrates', 'plants', 'ms-proteomics', 'affinity-proteomics'];
+  @Input() availableTemplates: string[] = [];
   @Output() complete = new EventEmitter<SdrfTable>();
   @Output() cancel = new EventEmitter<void>();
 

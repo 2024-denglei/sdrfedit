@@ -2253,7 +2253,7 @@ export class SdrfEditorComponent implements OnInit, OnChanges, AfterViewInit, On
   @Input() readonly = false;
 
   /** Available templates for the creation wizard (defaults to common templates) */
-  @Input() availableWizardTemplates: string[] = ['human', 'cell-lines', 'vertebrates', 'invertebrates', 'plants', 'ms-proteomics', 'affinity-proteomics'];
+  @Input() availableWizardTemplates: string[] = [];
 
   // ============ Outputs ============
 
