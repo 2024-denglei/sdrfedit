@@ -1,106 +1,110 @@
 # SDRF Editor
 
-[![License](https://img.shields.io/github/license/bigbio/sdrfedit)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/bigbio/sdrfedit?style=social)](https://github.com/bigbio/sdrfedit/stargazers)
-[![jsDelivr](https://data.jsdelivr.com/v1/package/gh/bigbio/sdrfedit/badge)](https://www.jsdelivr.com/package/gh/bigbio/sdrfedit)
+[![License](https://img.shields.io/github/license/2024-denglei/sdrfedit)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/2024-denglei/sdrfedit?style=social)](https://github.com/2024-denglei/sdrfedit/stargazers)
 
-Lightweight, self-hosted SDRF editing in the browser. `sdrfedit` helps create, edit, validate, and export Sample and Data Relationship Format files without requiring a backend.
+浏览器端 SDRF（Sample and Data Relationship Format）编辑器：创建、编辑、校验、导出蛋白质组学样本与数据关系表。本仓库在 [bigbio/sdrfedit](https://github.com/bigbio/sdrfedit) 基础上增强了 **6 步创建向导** 与可选的 **向导 AI 助手**。
 
-## Highlights
+中文使用说明见 [USER.md](USER.md)。
 
-- Browser-first SDRF editing with virtual scrolling for large tables
-- Guided SDRF creation wizard for building files from scratch
-- Ontology-aware cell editing with EBI OLS lookups
-- Validation through the deployed PRIDE SDRF validator API, with optional local browser validation via Pyodide
-- Optional AI-assisted recommendations for metadata cleanup and improvement
-- Optional wizard AI assistant that annotates a PXD dataset or your own paper for you
-- TSV and Excel export
+## 功能概览
 
-## Quick Start
+- **主编辑器**：大表虚拟滚动、本体感知单元格（EBI OLS）、TSV / Excel 导出
+- **创建向导（6 步）**：从模板到可提交的 SDRF 草稿
+- **校验**：默认走 PRIDE SDRF Validator API；也可选浏览器内 Pyodide 本地校验
+- **编辑器 AI 推荐**（可选，纯前端）：用你自己的 LLM Key 做元数据清理建议
+- **向导 AI 助手**（可选，需后端）：按步骤给出可一键 Apply 的填写卡片
+
+## 快速开始
+
+### 前端
 
 ```bash
 npm install
 ng serve
 ```
 
-Open `http://localhost:4200`.
+打开 http://localhost:4200 。
 
-For a production build:
+生产构建：
 
 ```bash
 npm run build
 ```
 
-## Validation
+构建产物在 `dist/`（本项目也会提交 `dist/`，便于 CDN / 嵌入）。
 
-The editor supports two validation modes:
+### 向导 AI 后端（可选）
 
-- `PRIDE API`: the default path, using the deployed SDRF validator service from PRIDE
-- `Local browser`: runs `sdrf-pipelines` in the browser via Pyodide when users do not want to send the file out
+助手面板需要 FastAPI 服务（LLM、MinerU、规范 RAG、PRIDE / OLS 等）：
 
-The local validator bundle is loaded from `src/assets/wheels/`, and the Pyodide worker lives in `src/app/workers/pyodide.worker.ts`.
+```bash
+cd backend
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env          # 填写 LLM_API_KEY 等
+python -m app.rag.build_index # 构建规范向量索引
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
 
-## AI Assistant
+健康检查：
 
-There are two independent AI features, and both are optional.
+```bash
+curl http://127.0.0.1:8000/api/health
+```
 
-### Editor recommendations (no backend)
+前端通过 `src/environments/environment.ts` 的 `assistantBaseUrl` 连接后端；嵌入部署可用 `window.__SDRF_ASSISTANT_URL__` 或 `localStorage.sdrf_assistant_url` 覆盖。详细配置见 [backend/README.md](backend/README.md)。
 
-Runs entirely in the browser with your own key for OpenAI, Anthropic, Google Gemini, or a
-local Ollama instance. It suggests fixes for validation errors and improves metadata
-quality on a table you already have open.
+## 创建向导（6 步）
 
-If you want stronger example-driven suggestions, build the local SDRF knowledge base:
+| 步骤 | 内容 |
+|------|------|
+| 1 Experiment Setup | 技术 / 样本 / 实验模板 + **生物样本数** |
+| 2 Sample Characteristics | 特征候选值 + **研究因子名与全部候选组** |
+| 3 Sample Values | source name、生物重复、多值特征、**按样本选因子** |
+| 4 Runs & Files | plex、MS run 打包、raw 入池、**按文件名映射 run + F/Tech** |
+| 5 Instrument & Protocol | 仪器、酶切、修饰（UNIMOD / MS） |
+| 6 Review & Create | 预览并生成表格进入主编辑器 |
+
+要点：
+
+- **sampleCount** = 各实验条件下生物重复之和（distinct biological `source name`），不是条件数，也不是 raw 文件数
+- **Study factor** 在 Step 2 定义候选值，在 Step 3 为每个样本赋值
+- AI 建议一律以 **卡片** 形式出现，需用户点击 Apply 才会写入向导
+
+## AI 能力
+
+### 1. 编辑器内推荐（无需后端）
+
+在已打开的表格上，用浏览器内配置的 OpenAI / Anthropic / Gemini / Ollama 等给出修改建议。
+
+可选：构建本地示例知识库以增强建议质量：
 
 ```bash
 git clone https://github.com/bigbio/sdrf-annotated-datasets.git
 node scripts/build-sdrf-index.js ./sdrf-annotated-datasets/datasets
 ```
 
-### Wizard assistant (needs the backend)
+### 2. 向导助手（需要后端）
 
-A chat panel docked beside **Create New SDRF** that fills the wizard in for you. It
-covers three situations:
+向导旁的聊天面板支持：
 
-1. **You have a ProteomeXchange accession.** It fetches the PRIDE metadata and raw file
-   list, finds the linked paper, reads its methods, and proposes values for the template
-   layers, characteristics, instrument, enzyme, modifications, plex kit, and file
-   assignment. For a paywalled paper it downloads and parses the PDF with MinerU, or asks
-   you to upload it.
-2. **You have a question about SDRF.** It answers from a vector index of
-   [the specification](https://sdrf.quantms.org/specification.html) and cites the section
-   it used.
-3. **You have your own manuscript.** Upload the PDF or paste the methods text, and it
-   proposes annotations the same way as case 1.
+1. **PXD 登录号**：拉 PRIDE 元数据与 raw 列表；优先将论文 PDF 经 MinerU 解析进会话，再逐步提出可 Apply 的卡片  
+2. **规范问答**：基于 [SDRF 规范](https://sdrf.quantms.org/specification.html) 向量检索作答并引用章节  
+3. **自有 PDF / 粘贴方法学**：上传或粘贴后按同样流程建议填写  
 
-Every suggestion arrives as a card showing `current → proposed`, and nothing changes
-until you click Apply. Ontology values are resolved through EBI OLS server-side, so the
-model cannot invent an accession.
+本体词通过服务端 EBI OLS 校验，避免模型编造 accession。
 
-This feature needs a small FastAPI service because it downloads PDFs, calls MinerU, and
-holds the LLM and embedding keys — none of which belong in a browser:
+## 校验
 
-```bash
-cd backend
-uv venv .venv && uv pip install -r requirements.txt   # or python3 -m venv + pip
-cp .env.example .env                                  # add LLM_API_KEY
-python -m app.rag.build_index                         # build the specification index
-uvicorn app.main:app --port 8000
-```
+| 模式 | 说明 |
+|------|------|
+| PRIDE API | 默认，调用线上 SDRF validator |
+| Local browser | 通过 Pyodide 在浏览器运行 `sdrf-pipelines`（`src/assets/wheels/`） |
 
-The frontend probes `GET /api/health` when the wizard opens and only shows the panel when
-the backend is reachable with an LLM configured. The backend URL comes from
-`assistantBaseUrl` in `src/environments/environment.ts`; CDN-embedded deployments can
-override it at runtime by setting `window.__SDRF_ASSISTANT_URL__` or the
-`sdrf_assistant_url` key in `localStorage`. Add your frontend origin to `CORS_ORIGINS` in
-`backend/.env`.
+## 嵌入（CDN）
 
-See [`backend/README.md`](backend/README.md) for the LLM, embedding, and MinerU
-configuration options, and for how to swap the vector store or PDF parser.
-
-## Embedding
-
-The editor bundle is committed to `dist/` and served directly from GitHub through jsDelivr.
+可将构建产物嵌入其他页面（示例指向本仓库 `main`；也可换分支 / tag）：
 
 ```html
 <!DOCTYPE html>
@@ -108,73 +112,63 @@ The editor bundle is committed to `dist/` and served directly from GitHub throug
   <head>
     <link
       rel="stylesheet"
-      href="https://cdn.jsdelivr.net/gh/bigbio/sdrfedit@main/dist/sdrf-editor/browser/styles.css"
-    >
+      href="https://cdn.jsdelivr.net/gh/2024-denglei/sdrfedit@main/dist/sdrf-editor/browser/styles.css"
+    />
   </head>
   <body>
     <app-root></app-root>
-
     <script
-      src="https://cdn.jsdelivr.net/gh/bigbio/sdrfedit@main/dist/sdrf-editor/browser/polyfills.js"
+      src="https://cdn.jsdelivr.net/gh/2024-denglei/sdrfedit@main/dist/sdrf-editor/browser/polyfills.js"
       type="module"
     ></script>
     <script
-      src="https://cdn.jsdelivr.net/gh/bigbio/sdrfedit@main/dist/sdrf-editor/browser/main.js"
+      src="https://cdn.jsdelivr.net/gh/2024-denglei/sdrfedit@main/dist/sdrf-editor/browser/main.js"
       type="module"
     ></script>
   </body>
 </html>
 ```
 
-After changing the app, rebuild and commit `dist/` so the CDN version updates.
+改完前端后请重新 `npm run build` 并提交更新后的 `dist/`。
 
-## Project Structure
+## 目录结构
 
 ```text
 src/
-├── app/
-│   ├── components/
-│   ├── core/
-│   └── workers/
-├── assets/
-├── environments/
-└── index.html
-backend/                 # optional wizard assistant service
-├── app/
-│   ├── llm/             # agent loop, prompts, streaming client
-│   ├── parsing/         # MinerU backends behind one interface
-│   ├── rag/             # specification chunking, embeddings, vector store
-│   ├── routers/         # /api/chat, /api/uploads
-│   └── tools/           # PRIDE, Europe PMC, OLS, templates, spec search
-└── data/spec_index/     # generated knowledge base
+├── app/components/sdrf-editor/     # 主编辑器
+├── app/components/sdrf-wizard/     # 创建向导
+├── app/components/wizard-ai-panel/ # 向导 AI 面板
+├── app/core/services/              # 解析、校验、导出、向导状态
+├── app/core/services/assistant/    # 助手 API 与 action bridge
+└── workers/                        # Pyodide 等
+backend/                            # 向导 AI FastAPI 服务
+├── app/llm/                        # agent、prompts、流式客户端
+├── app/parsing/                    # MinerU PDF 解析
+├── app/rag/                        # 规范分块与检索
+├── app/tools/                      # PRIDE、文献、OLS、模板
+└── tests/
+sdrf-proteomics/                    # 规范 / 模板相关参考资料（本地）
 ```
 
-Key areas:
+## 相关链接
 
-- `src/app/components/sdrf-editor/`: main editor UI
-- `src/app/components/sdrf-wizard/`: creation wizard
-- `src/app/components/wizard-ai-panel/`: wizard assistant chat panel
-- `src/app/core/services/`: parsing, validation, export, AI, and cache services
-- `src/app/core/services/assistant/`: backend transport and the wizard action bridge
-- `src/app/workers/pyodide.worker.ts`: local validation worker
-- `backend/`: FastAPI service for the wizard assistant (see `backend/README.md`)
-
-## Related Projects
-
-- [SDRF specification website](https://sdrf.quantms.org)
+- 上游项目：[bigbio/sdrfedit](https://github.com/bigbio/sdrfedit)
+- [SDRF 规范站](https://sdrf.quantms.org)
 - [proteomics-metadata-standard](https://github.com/bigbio/proteomics-metadata-standard)
 - [sdrf-pipelines](https://github.com/bigbio/sdrf-pipelines)
 - [sdrf-annotated-datasets](https://github.com/bigbio/sdrf-annotated-datasets)
 
-## Contributing
+## 贡献
 
 ```bash
 git checkout -b feature/my-change
 npm install
 npm run build
+# 若改了后端：
+cd backend && pytest
 ```
 
-Then commit your changes, include updated build artifacts when needed, and open a pull request.
+提交变更；若影响前端产物，请一并更新 `dist/`。
 
 ## License
 
