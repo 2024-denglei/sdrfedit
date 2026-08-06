@@ -236,3 +236,10 @@ backend/.env
 backend/.venv/
 backend/data/spec_index/
 backend/data/cellline_index/
+
+# Local LLM secrets / session artifacts (never commit API keys)
+**/llm.local.json
+.tmp-nginx/
+PXD*.pdf
+sdrf-agent-trace-*.json
+*.canvas.tsx
