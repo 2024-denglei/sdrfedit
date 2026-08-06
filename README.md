@@ -3,108 +3,108 @@
 [![License](https://img.shields.io/github/license/2024-denglei/sdrfedit)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/2024-denglei/sdrfedit?style=social)](https://github.com/2024-denglei/sdrfedit/stargazers)
 
-浏览器端 SDRF（Sample and Data Relationship Format）编辑器：创建、编辑、校验、导出蛋白质组学样本与数据关系表。本仓库在 [bigbio/sdrfedit](https://github.com/bigbio/sdrfedit) 基础上增强了 **6 步创建向导** 与可选的 **向导 AI 助手**。
+Browser-based editor for the Sample and Data Relationship Format (SDRF): create, edit, validate, and export proteomics sample–data relationship tables. This fork builds on [bigbio/sdrfedit](https://github.com/bigbio/sdrfedit) with an improved **6-step creation wizard** and an optional **wizard AI assistant**.
 
-中文使用说明见 [USER.md](USER.md)。
+For a longer Chinese walkthrough, see [USER.md](USER.md).
 
-## 功能概览
+## Highlights
 
-- **主编辑器**：大表虚拟滚动、本体感知单元格（EBI OLS）、TSV / Excel 导出
-- **创建向导（6 步）**：从模板到可提交的 SDRF 草稿
-- **校验**：默认走 PRIDE SDRF Validator API；也可选浏览器内 Pyodide 本地校验
-- **编辑器 AI 推荐**（可选，纯前端）：用你自己的 LLM Key 做元数据清理建议
-- **向导 AI 助手**（可选，需后端）：按步骤给出可一键 Apply 的填写卡片
+- **Main editor** — virtual scrolling for large tables, ontology-aware cells (EBI OLS), TSV / Excel export
+- **Creation wizard (6 steps)** — from templates to a draft SDRF ready for review
+- **Validation** — PRIDE SDRF Validator API by default; optional in-browser Pyodide / `sdrf-pipelines`
+- **Editor AI recommendations** (optional, frontend-only) — metadata cleanup with your own LLM key
+- **Wizard AI assistant** (optional, needs backend) — step-scoped suggestions as one-click Apply cards
 
-## 快速开始
+## Quick start
 
-### 前端
+### Frontend
 
 ```bash
 npm install
 ng serve
 ```
 
-打开 http://localhost:4200 。
+Open http://localhost:4200 .
 
-生产构建：
+Production build:
 
 ```bash
 npm run build
 ```
 
-构建产物在 `dist/`（本项目也会提交 `dist/`，便于 CDN / 嵌入）。
+Build output lives in `dist/` (committed so CDN / embed deployments stay in sync).
 
-### 向导 AI 后端（可选）
+### Wizard AI backend (optional)
 
-助手面板需要 FastAPI 服务（LLM、MinerU、规范 RAG、PRIDE / OLS 等）：
+The assistant panel needs a small FastAPI service (LLM, MinerU, spec RAG, PRIDE / OLS, …):
 
 ```bash
 cd backend
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env          # 填写 LLM_API_KEY 等
-python -m app.rag.build_index # 构建规范向量索引
+cp .env.example .env          # set LLM_API_KEY and related options
+python -m app.rag.build_index # build the specification vector index
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-健康检查：
+Health check:
 
 ```bash
 curl http://127.0.0.1:8000/api/health
 ```
 
-前端通过 `src/environments/environment.ts` 的 `assistantBaseUrl` 连接后端；嵌入部署可用 `window.__SDRF_ASSISTANT_URL__` 或 `localStorage.sdrf_assistant_url` 覆盖。详细配置见 [backend/README.md](backend/README.md)。
+The frontend connects via `assistantBaseUrl` in `src/environments/environment.ts`. Embedded deployments can override with `window.__SDRF_ASSISTANT_URL__` or `localStorage.sdrf_assistant_url`. See [backend/README.md](backend/README.md) for LLM, embedding, and MinerU configuration.
 
-## 创建向导（6 步）
+## Creation wizard (6 steps)
 
-| 步骤 | 内容 |
-|------|------|
-| 1 Experiment Setup | 技术 / 样本 / 实验模板 + **生物样本数** |
-| 2 Sample Characteristics | 特征候选值 + **研究因子名与全部候选组** |
-| 3 Sample Values | source name、生物重复、多值特征、**按样本选因子** |
-| 4 Runs & Files | plex、MS run 打包、raw 入池、**按文件名映射 run + F/Tech** |
-| 5 Instrument & Protocol | 仪器、酶切、修饰（UNIMOD / MS） |
-| 6 Review & Create | 预览并生成表格进入主编辑器 |
+| Step | What you fill |
+|------|----------------|
+| 1 Experiment Setup | Technology / sample / experiment templates + **biological sample count** |
+| 2 Sample Characteristics | Characteristic candidate values + **study factor names and all group labels** |
+| 3 Sample Values | Source names, biological replicates, multi-value characteristics, **per-sample factor picks** |
+| 4 Runs & Files | Plex kit, MS-run packing, raw-file pool, **file→run mapping with fraction / tech** |
+| 5 Instrument & Protocol | Instrument, cleavage agent, modifications (MS / UNIMOD) |
+| 6 Review & Create | Preview and generate the table into the main editor |
 
-要点：
+Notes:
 
-- **sampleCount** = 各实验条件下生物重复之和（distinct biological `source name`），不是条件数，也不是 raw 文件数
-- **Study factor** 在 Step 2 定义候选值，在 Step 3 为每个样本赋值
-- AI 建议一律以 **卡片** 形式出现，需用户点击 Apply 才会写入向导
+- **`sampleCount`** = sum of biological replicates across conditions (distinct biological `source name`s) — not the number of conditions, and not the raw-file count
+- **Study factors** are defined on Step 2 (candidates) and assigned per sample on Step 3
+- AI suggestions appear as **cards**; nothing is written until you click Apply
 
-## AI 能力
+## AI features
 
-### 1. 编辑器内推荐（无需后端）
+### 1. Editor recommendations (no backend)
 
-在已打开的表格上，用浏览器内配置的 OpenAI / Anthropic / Gemini / Ollama 等给出修改建议。
+On an open table, use a browser-configured OpenAI / Anthropic / Gemini / Ollama key to suggest fixes and metadata improvements.
 
-可选：构建本地示例知识库以增强建议质量：
+Optional local example index for stronger suggestions:
 
 ```bash
 git clone https://github.com/bigbio/sdrf-annotated-datasets.git
 node scripts/build-sdrf-index.js ./sdrf-annotated-datasets/datasets
 ```
 
-### 2. 向导助手（需要后端）
+### 2. Wizard assistant (needs backend)
 
-向导旁的聊天面板支持：
+The chat panel beside **Create New SDRF** supports:
 
-1. **PXD 登录号**：拉 PRIDE 元数据与 raw 列表；优先将论文 PDF 经 MinerU 解析进会话，再逐步提出可 Apply 的卡片  
-2. **规范问答**：基于 [SDRF 规范](https://sdrf.quantms.org/specification.html) 向量检索作答并引用章节  
-3. **自有 PDF / 粘贴方法学**：上传或粘贴后按同样流程建议填写  
+1. **ProteomeXchange accession (PXD…)** — fetch PRIDE metadata and raw names; prefer downloading the paper PDF and parsing it with MinerU into a session document, then propose Apply cards step by step  
+2. **Specification Q&A** — retrieve from a vector index of the [SDRF specification](https://sdrf.quantms.org/specification.html) with section citations  
+3. **Your own PDF or pasted methods** — upload or paste, then annotate the same way as (1)  
 
-本体词通过服务端 EBI OLS 校验，避免模型编造 accession。
+Ontology values are verified server-side through EBI OLS so the model cannot invent accessions.
 
-## 校验
+## Validation
 
-| 模式 | 说明 |
-|------|------|
-| PRIDE API | 默认，调用线上 SDRF validator |
-| Local browser | 通过 Pyodide 在浏览器运行 `sdrf-pipelines`（`src/assets/wheels/`） |
+| Mode | Description |
+|------|-------------|
+| PRIDE API | Default; calls the online SDRF validator |
+| Local browser | Runs `sdrf-pipelines` in the browser via Pyodide (`src/assets/wheels/`) |
 
-## 嵌入（CDN）
+## Embedding (CDN)
 
-可将构建产物嵌入其他页面（示例指向本仓库 `main`；也可换分支 / tag）：
+Embed the committed build (example points at this repo’s `main`; change branch/tag as needed):
 
 ```html
 <!DOCTYPE html>
@@ -129,46 +129,46 @@ node scripts/build-sdrf-index.js ./sdrf-annotated-datasets/datasets
 </html>
 ```
 
-改完前端后请重新 `npm run build` 并提交更新后的 `dist/`。
+After frontend changes, rebuild with `npm run build` and commit the updated `dist/`.
 
-## 目录结构
+## Project structure
 
 ```text
 src/
-├── app/components/sdrf-editor/     # 主编辑器
-├── app/components/sdrf-wizard/     # 创建向导
-├── app/components/wizard-ai-panel/ # 向导 AI 面板
-├── app/core/services/              # 解析、校验、导出、向导状态
-├── app/core/services/assistant/    # 助手 API 与 action bridge
-└── workers/                        # Pyodide 等
-backend/                            # 向导 AI FastAPI 服务
-├── app/llm/                        # agent、prompts、流式客户端
-├── app/parsing/                    # MinerU PDF 解析
-├── app/rag/                        # 规范分块与检索
-├── app/tools/                      # PRIDE、文献、OLS、模板
+├── app/components/sdrf-editor/     # Main editor
+├── app/components/sdrf-wizard/     # Creation wizard
+├── app/components/wizard-ai-panel/ # Wizard AI chat panel
+├── app/core/services/              # Parse, validate, export, wizard state
+├── app/core/services/assistant/    # Assistant API + action bridge
+└── workers/                        # Pyodide and related workers
+backend/                            # Wizard AI FastAPI service
+├── app/llm/                        # Agent, prompts, streaming client
+├── app/parsing/                    # MinerU PDF parsing
+├── app/rag/                        # Spec chunking and retrieval
+├── app/tools/                      # PRIDE, literature, OLS, templates
 └── tests/
-sdrf-proteomics/                    # 规范 / 模板相关参考资料（本地）
+sdrf-proteomics/                    # Local specification / template reference material
 ```
 
-## 相关链接
+## Related projects
 
-- 上游项目：[bigbio/sdrfedit](https://github.com/bigbio/sdrfedit)
-- [SDRF 规范站](https://sdrf.quantms.org)
+- Upstream: [bigbio/sdrfedit](https://github.com/bigbio/sdrfedit)
+- [SDRF specification site](https://sdrf.quantms.org)
 - [proteomics-metadata-standard](https://github.com/bigbio/proteomics-metadata-standard)
 - [sdrf-pipelines](https://github.com/bigbio/sdrf-pipelines)
 - [sdrf-annotated-datasets](https://github.com/bigbio/sdrf-annotated-datasets)
 
-## 贡献
+## Contributing
 
 ```bash
 git checkout -b feature/my-change
 npm install
 npm run build
-# 若改了后端：
+# if you change the backend:
 cd backend && pytest
 ```
 
-提交变更；若影响前端产物，请一并更新 `dist/`。
+Commit your changes; if the frontend bundle changes, include the updated `dist/`.
 
 ## License
 
