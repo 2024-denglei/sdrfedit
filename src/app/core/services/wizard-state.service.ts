@@ -24,6 +24,7 @@ import {
   createEmptyWizardState,
   createDefaultSample,
   createDefaultDiseaseFactor,
+  normalizeFactor,
   getSampleTemplateId,
   hasCellLinesExperiment,
   isHumanTemplate,
@@ -206,17 +207,31 @@ export class WizardStateService {
         getSpecialtyCharacteristicKey(c.name) !== 'material type'
     );
 
-    if (required.length === 0) {
-      return (
-        (choices['characteristics[organism]'] || []).length >= 1 &&
-        (choices['characteristics[disease]'] || []).length >= 1 &&
-        (choices['characteristics[organism part]'] || []).length >= 1
-      );
-    }
+    const characteristicsOk =
+      required.length === 0
+        ? (choices['characteristics[organism]'] || []).length >= 1 &&
+          (choices['characteristics[disease]'] || []).length >= 1 &&
+          (choices['characteristics[organism part]'] || []).length >= 1
+        : required.every(col => (choices[col.name] || []).length >= 1);
 
-    return required.every(col => (choices[col.name] || []).length >= 1);
+    return characteristicsOk && this.isFactorsDefined();
   });
 
+  /**
+   * Step 2: at least one enabled factor with a name and ≥1 candidate value.
+   */
+  readonly isFactorsDefined = computed(() => {
+    const factors = this._state().factors.filter(f => f.enabled);
+    return (
+      factors.length > 0 &&
+      factors.every(f => f.name.trim().length > 0 && (f.values?.length || 0) >= 1)
+    );
+  });
+
+  /** @deprecated Use isFactorsDefined (Step 2) or per-sample checks in isStep3Valid. */
+  readonly isFactorsValid = this.isFactorsDefined;
+
+  /** Sample Values: names, bio-reps, multi-value chars, and per-sample factor picks. */
   readonly isStep3Valid = computed(() => {
     const state = this._state();
     if (state.samples.length === 0) return false;
@@ -229,9 +244,16 @@ export class WizardStateService {
       return (state.characteristicChoices?.[c.name] || []).length >= 2;
     });
 
-    return state.samples.every(sample =>
+    const sampleValuesOk = state.samples.every(sample =>
       multiRequired.every(col => !!sample.characteristicValues?.[col.name]?.trim())
     );
+
+    const enabledFactors = state.factors.filter(f => f.enabled && f.name.trim());
+    const factorValuesOk = state.samples.every(sample =>
+      enabledFactors.every(f => !!sample.factorValues?.[f.name]?.trim())
+    );
+
+    return sampleValuesOk && factorValuesOk;
   });
 
   readonly isStep4Valid = computed(() => {
@@ -251,10 +273,8 @@ export class WizardStateService {
     return state.dataFiles.length > 0;
   });
 
-  readonly isStep7Valid = computed(() => {
-    const factors = this._state().factors.filter(f => f.enabled);
-    return factors.length > 0 && factors.every(f => f.name.trim().length > 0);
-  });
+  /** @deprecated Use `isFactorsDefined`. */
+  readonly isStep7Valid = this.isFactorsDefined;
 
   readonly isAllValid = computed(() => {
     return (
@@ -262,8 +282,7 @@ export class WizardStateService {
       this.isStep2Valid() &&
       this.isStep3Valid() &&
       this.isRunsFilesValid() &&
-      this.isStep5Valid() &&
-      this.isStep7Valid()
+      this.isStep5Valid()
     );
   });
 
@@ -281,8 +300,6 @@ export class WizardStateService {
         return this.isRunsFilesValid();
       case 'protocol':
         return this.isStep5Valid();
-      case 'factors':
-        return this.isStep7Valid();
       case 'review':
         return this.isAllValid();
       default:
@@ -309,13 +326,15 @@ export class WizardStateService {
   nextStep(): void {
     if (this.canProceed()) {
       const next = this._currentStep() + 1;
-      if (WIZARD_STEPS[next]?.id === 'samples') {
-        this.syncCharacteristicAssignments();
-      }
-      this._currentStep.set(next);
-      if (WIZARD_STEPS[next]?.id === 'factors') {
+      if (WIZARD_STEPS[next]?.id === 'characteristics') {
         this.ensureDefaultFactors();
       }
+      if (WIZARD_STEPS[next]?.id === 'samples') {
+        this.syncCharacteristicAssignments();
+        this.syncFactorAssignments();
+        this.ensureDefaultFactors();
+      }
+      this._currentStep.set(next);
       if (WIZARD_STEPS[next]?.id === 'runs-files') {
         this.ensureMsRunsForFilesStep();
       }
@@ -330,13 +349,15 @@ export class WizardStateService {
 
   goToStep(step: number): void {
     if (step >= 0 && step < this.totalSteps) {
-      if (WIZARD_STEPS[step]?.id === 'samples') {
-        this.syncCharacteristicAssignments();
-      }
-      this._currentStep.set(step);
-      if (WIZARD_STEPS[step]?.id === 'factors') {
+      if (WIZARD_STEPS[step]?.id === 'characteristics') {
         this.ensureDefaultFactors();
       }
+      if (WIZARD_STEPS[step]?.id === 'samples') {
+        this.syncCharacteristicAssignments();
+        this.syncFactorAssignments();
+        this.ensureDefaultFactors();
+      }
+      this._currentStep.set(step);
       if (WIZARD_STEPS[step]?.id === 'runs-files') {
         this.ensureMsRunsForFilesStep();
       }
@@ -1305,6 +1326,49 @@ export class WizardStateService {
     }));
   }
 
+  /**
+   * Assign files to runs by exact file name, optionally setting fraction / tech.
+   * Used by AI recommendation cards (`assignFilesToRunsByName`).
+   */
+  assignDataFilesToRunsByName(
+    assignments: Array<{
+      runId: string;
+      files: Array<{ fileName: string; fractionId: number; technicalReplicate: number }>;
+    }>
+  ): void {
+    if (!assignments.length) return;
+
+    const byName = new Map<
+      string,
+      { runId: string; fractionId: number; technicalReplicate: number }
+    >();
+    for (const group of assignments) {
+      for (const file of group.files) {
+        const key = file.fileName.trim();
+        if (!key) continue;
+        byName.set(key, {
+          runId: group.runId,
+          fractionId: Math.max(1, Math.floor(file.fractionId) || 1),
+          technicalReplicate: Math.max(1, Math.floor(file.technicalReplicate) || 1),
+        });
+      }
+    }
+
+    this._state.update(s => ({
+      ...s,
+      dataFiles: s.dataFiles.map(f => {
+        const hit = byName.get((f.fileName || '').trim());
+        if (!hit) return f;
+        return {
+          ...f,
+          runId: hit.runId,
+          fractionId: hit.fractionId,
+          technicalReplicate: hit.technicalReplicate,
+        };
+      }),
+    }));
+  }
+
   unassignDataFiles(indices: number[]): void {
     const set = new Set(indices);
     this._state.update(s => ({
@@ -1350,21 +1414,27 @@ export class WizardStateService {
     this.generateFileSlotsFromPlanner();
   }
 
-  // ============ Step 7: Factor Values ============
+  // ============ Factors (defined on Step 2, assigned per sample on Step 3) ============
 
   ensureDefaultFactors(): void {
     this._state.update(s => {
-      const diseaseValue = typeof s.disease === 'string'
-        ? s.disease
-        : s.disease?.label?.toLowerCase() || 'not available';
+      const diseaseChoice = (s.characteristicChoices?.['characteristics[disease]'] || [])[0]?.value;
+      const diseaseValue =
+        diseaseChoice ||
+        (typeof s.disease === 'string' ? s.disease : s.disease?.label?.toLowerCase()) ||
+        '';
 
-      if (s.factors.length === 0) {
+      if (!s.factors.length) {
         return { ...s, factors: [createDefaultDiseaseFactor(diseaseValue)] };
       }
 
-      const factors = s.factors.map(f => {
-        if (f.sourceCharacteristic === 'disease') {
-          return { ...f, defaultValue: diseaseValue };
+      const factors = s.factors.map(normalizeFactor).map(f => {
+        if (
+          f.name.toLowerCase() === 'disease' &&
+          f.values.length === 0 &&
+          diseaseValue.trim()
+        ) {
+          return { ...f, values: [diseaseValue.trim()] };
         }
         return f;
       });
@@ -1373,21 +1443,25 @@ export class WizardStateService {
   }
 
   setFactors(factors: WizardFactor[]): void {
-    this._state.update(s => ({ ...s, factors }));
+    this._state.update(s => ({
+      ...s,
+      factors: factors.map(normalizeFactor).filter(f => f.name.trim()),
+    }));
   }
 
   addFactor(factor: WizardFactor): void {
+    const next = normalizeFactor(factor);
     this._state.update(s => ({
       ...s,
-      factors: [...s.factors, factor],
+      factors: [...s.factors.map(normalizeFactor), next],
     }));
   }
 
   updateFactor(index: number, updates: Partial<WizardFactor>): void {
     this._state.update(s => {
-      const factors = [...s.factors];
+      const factors = s.factors.map(normalizeFactor);
       if (index >= 0 && index < factors.length) {
-        factors[index] = { ...factors[index], ...updates };
+        factors[index] = normalizeFactor({ ...factors[index], ...updates });
       }
       return { ...s, factors };
     });
@@ -1395,7 +1469,7 @@ export class WizardStateService {
 
   removeFactor(index: number): void {
     this._state.update(s => {
-      const factors = s.factors.filter((_, i) => i !== index);
+      const factors = s.factors.map(normalizeFactor).filter((_, i) => i !== index);
       return {
         ...s,
         factors: factors.length > 0 ? factors : [createDefaultDiseaseFactor()],
@@ -1407,11 +1481,172 @@ export class WizardStateService {
     this.updateFactor(index, { enabled });
   }
 
+  addFactorValue(index: number, value: string): void {
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    this._state.update(s => {
+      const factors = s.factors.map(normalizeFactor);
+      if (index < 0 || index >= factors.length) return s;
+      const current = factors[index];
+      if (current.values.some(v => choiceValuesEqual(v, trimmed))) return s;
+      factors[index] = { ...current, values: [...current.values, trimmed] };
+      return { ...s, factors };
+    });
+  }
+
+  /** Append a candidate by factor name (AI / bridge). */
+  addFactorValueByName(factorName: string, value: string): void {
+    const trimmedName = factorName.trim();
+    const trimmed = value.trim();
+    if (!trimmedName || !trimmed) return;
+    this._state.update(s => {
+      const factors = s.factors.map(normalizeFactor);
+      const index = factors.findIndex(f => f.name.toLowerCase() === trimmedName.toLowerCase());
+      if (index < 0) {
+        return {
+          ...s,
+          factors: [...factors, { name: trimmedName, enabled: true, values: [trimmed] }],
+        };
+      }
+      const current = factors[index];
+      if (current.values.some(v => choiceValuesEqual(v, trimmed))) return s;
+      factors[index] = { ...current, values: [...current.values, trimmed] };
+      return { ...s, factors };
+    });
+  }
+
+  removeFactorValue(index: number, value: string): void {
+    this._state.update(s => {
+      const factors = s.factors.map(normalizeFactor);
+      if (index < 0 || index >= factors.length) return s;
+      factors[index] = {
+        ...factors[index],
+        values: factors[index].values.filter(v => !choiceValuesEqual(v, value)),
+      };
+      return { ...s, factors };
+    });
+  }
+
+  /**
+   * Sync sample.factorValues from factor candidate lists when entering Step 3.
+   */
+  syncFactorAssignments(): void {
+    this._state.update(s => {
+      const factors = s.factors.map(normalizeFactor).filter(f => f.enabled && f.name.trim());
+      const samples = s.samples.map(sample => {
+        const values = { ...(sample.factorValues || {}) };
+        for (const factor of factors) {
+          const list = factor.values || [];
+          if (list.length === 1) {
+            values[factor.name] = list[0];
+          } else if (list.length === 0) {
+            delete values[factor.name];
+          } else if (
+            values[factor.name] &&
+            !list.some(v => choiceValuesEqual(v, values[factor.name]))
+          ) {
+            delete values[factor.name];
+          }
+        }
+        for (const key of Object.keys(values)) {
+          if (!factors.some(f => f.name === key)) delete values[key];
+        }
+        return { ...sample, factorValues: values };
+      });
+      return { ...s, samples };
+    });
+  }
+
+  setSampleFactorValue(sampleIndex: number, factorName: string, value: string): void {
+    const name = factorName.trim();
+    if (!name) return;
+    this._state.update(s => {
+      const samples = [...s.samples];
+      if (sampleIndex < 0 || sampleIndex >= samples.length) return s;
+      const sample = { ...samples[sampleIndex] };
+      const factorValues = { ...(sample.factorValues || {}) };
+      if (!value.trim()) delete factorValues[name];
+      else factorValues[name] = value.trim();
+      sample.factorValues = factorValues;
+      samples[sampleIndex] = sample;
+      return { ...s, samples };
+    });
+  }
+
+  /**
+   * Assign an entire factor column in sample order (length must match sample count).
+   * Used by AI one-click mapping cards.
+   */
+  setFactorColumnValues(factorName: string, values: string[]): void {
+    const name = factorName.trim();
+    if (!name) return;
+    this._state.update(s => {
+      if (values.length !== s.samples.length) {
+        return s;
+      }
+      const allowed = new Set(
+        (s.factors.map(normalizeFactor).find(f => f.name === name)?.values || []).map(v =>
+          v.trim().toLowerCase()
+        )
+      );
+      const samples = s.samples.map((sample, i) => {
+        const raw = (values[i] || '').trim();
+        const factorValues = { ...(sample.factorValues || {}) };
+        if (!raw) {
+          delete factorValues[name];
+        } else if (allowed.size === 0 || allowed.has(raw.toLowerCase())) {
+          factorValues[name] = raw;
+        } else {
+          // Still set — AI may propose before candidates are fully synced
+          factorValues[name] = raw;
+        }
+        return { ...sample, factorValues };
+      });
+      return { ...s, samples };
+    });
+  }
+
+  enabledFactors(): WizardFactor[] {
+    return this._state()
+      .factors.map(normalizeFactor)
+      .filter(f => f.enabled && f.name.trim());
+  }
+
   // ============ Reset ============
 
   reset(): void {
     this._state.set(createEmptyWizardState());
     this._currentStep.set(0);
+  }
+
+  /**
+   * Restore a previously persisted wizard form (chat history / accidental leave).
+   * Merges onto an empty baseline so older snapshots missing new fields still work.
+   */
+  hydrate(state: WizardState, step = 0): void {
+    const baseline = createEmptyWizardState();
+    const factors = (state.factors?.length ? state.factors : baseline.factors).map(normalizeFactor);
+    const samples = (state.samples?.length ? state.samples : baseline.samples).map(sample => ({
+      ...sample,
+      factorValues: sample.factorValues || {},
+    }));
+    const next: WizardState = {
+      ...baseline,
+      ...state,
+      characteristicChoices: state.characteristicChoices || {},
+      characteristicColumns: state.characteristicColumns || [],
+      experimentTemplates: state.experimentTemplates || [],
+      samples,
+      msRuns: state.msRuns?.length ? state.msRuns : baseline.msRuns,
+      dataFiles: state.dataFiles || [],
+      modifications: state.modifications || [],
+      factors,
+      dynamicColumnDefaults: state.dynamicColumnDefaults || [],
+      customLabels: state.customLabels || [],
+    };
+    this._state.set(next);
+    const maxStep = Math.max(0, WIZARD_STEPS.length - 1);
+    this._currentStep.set(Math.min(Math.max(0, Math.floor(step) || 0), maxStep));
   }
 
   // ============ Helpers ============

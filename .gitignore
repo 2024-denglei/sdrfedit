@@ -230,3 +230,9 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 node_modules
+
+# Wizard assistant backend (local env + generated index)
+backend/.env
+backend/.venv/
+backend/data/spec_index/
+backend/data/cellline_index/

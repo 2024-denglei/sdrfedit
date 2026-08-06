@@ -12,3 +12,5 @@ export * from './sdrf-export.service';
 export * from './column-quality.service';
 export * from './data-cleaning.service';
 export * from './llm';
+export * from './assistant/assistant-api.service';
+export * from './assistant/wizard-ai-bridge.service';

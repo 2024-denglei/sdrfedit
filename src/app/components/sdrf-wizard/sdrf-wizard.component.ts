@@ -12,10 +12,12 @@ import {
   inject,
   OnInit,
   ChangeDetectionStrategy,
+  signal,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 
 import { WizardStateService } from '../../core/services/wizard-state.service';
+import { ChatHistoryService } from '../../core/services/assistant/chat-history.service';
 import { SdrfTable } from '../../core/models/sdrf-table';
 import { WizardGeneratorService } from '../../core/services/wizard-generator.service';
 import { TemplateService } from '../../core/services/template.service';
@@ -26,8 +28,8 @@ import { SampleCharacteristicsComponent } from './steps/sample-characteristics.c
 import { SampleValuesComponent } from './steps/sample-values.component';
 import { RunsFilesComponent } from './steps/runs-files.component';
 import { InstrumentProtocolComponent } from './steps/instrument-protocol.component';
-import { FactorValuesComponent } from './steps/factor-values.component';
 import { ReviewCreateComponent } from './steps/review-create.component';
+import { WizardAiPanelComponent } from '../wizard-ai-panel/wizard-ai-panel.component';
 
 @Component({
   selector: 'sdrf-wizard',
@@ -39,17 +41,25 @@ import { ReviewCreateComponent } from './steps/review-create.component';
     SampleValuesComponent,
     RunsFilesComponent,
     InstrumentProtocolComponent,
-    FactorValuesComponent,
     ReviewCreateComponent,
+    WizardAiPanelComponent,
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="wizard-overlay" (click)="onOverlayClick($event)">
-      <div class="wizard-container" (click)="$event.stopPropagation()">
+      <div class="wizard-shell" (click)="$event.stopPropagation()">
+      <div class="wizard-container">
         <!-- Header -->
         <div class="wizard-header">
           <h2>Create New SDRF</h2>
-          <button class="btn-close" (click)="onCancel()" title="Close">&times;</button>
+          <div class="header-actions">
+            @if (aiEnabled && !showAiPanel()) {
+              <button class="btn-assistant" (click)="showAiPanel.set(true)" title="Open the SDRF assistant">
+                Ask AI
+              </button>
+            }
+            <button class="btn-close" (click)="onCancel()" title="Close">&times;</button>
+          </div>
         </div>
 
         <!-- Progress Steps -->
@@ -100,9 +110,6 @@ import { ReviewCreateComponent } from './steps/review-create.component';
               <wizard-instrument-protocol [aiEnabled]="aiEnabled" />
             }
             @case (5) {
-              <wizard-factor-values />
-            }
-            @case (6) {
               <wizard-review-create
                 [aiEnabled]="aiEnabled"
                 (createTable)="onCreate($event)"
@@ -144,6 +151,11 @@ import { ReviewCreateComponent } from './steps/review-create.component';
           }
         </div>
       </div>
+
+      @if (aiEnabled && showAiPanel()) {
+        <wizard-ai-panel (close)="showAiPanel.set(false)" />
+      }
+      </div>
     </div>
   `,
   styles: [`
@@ -163,16 +175,61 @@ import { ReviewCreateComponent } from './steps/review-create.component';
       to { opacity: 1; }
     }
 
+    /*
+     * Sized to its content so the docked assistant, whose width the user can drag,
+     * simply adds to the overlay instead of squeezing the wizard. Both panes share
+     * the same height so the assistant is not a short floating card.
+     */
+    .wizard-shell {
+      display: flex;
+      align-items: stretch;
+      gap: 14px;
+      width: fit-content;
+      max-width: 98vw;
+      height: min(90vh, 920px);
+      max-height: 90vh;
+      animation: slideUp 0.25s ease-out;
+    }
+
     .wizard-container {
       background: white;
       border-radius: 12px;
       box-shadow: 0 25px 80px rgba(0, 0, 0, 0.3);
-      width: 95%;
-      max-width: 900px;
-      max-height: 90vh;
+      flex: 1 1 900px;
+      width: 900px;
+      min-width: 0;
+      min-height: 0;
+      height: 100%;
       display: flex;
       flex-direction: column;
-      animation: slideUp 0.25s ease-out;
+    }
+
+    wizard-ai-panel {
+      display: flex;
+      align-self: stretch;
+      min-height: 0;
+      height: 100%;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .btn-assistant {
+      background: #eef2ff;
+      color: #4338ca;
+      border: 1px solid #c7d2fe;
+      border-radius: 6px;
+      padding: 5px 12px;
+      font-size: 12.5px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+
+    .btn-assistant:hover {
+      background: #e0e7ff;
     }
 
     @keyframes slideUp {
@@ -384,9 +441,13 @@ export class SdrfWizardComponent implements OnInit {
   @Output() complete = new EventEmitter<SdrfTable>();
   @Output() cancel = new EventEmitter<void>();
 
+  /** The assistant starts docked so its capabilities are discoverable. */
+  readonly showAiPanel = signal(true);
+
   readonly wizardState = inject(WizardStateService);
   private readonly generator = inject(WizardGeneratorService);
   readonly templateService = inject(TemplateService);
+  private readonly chatHistory = inject(ChatHistoryService);
 
   constructor() {
     // Reset wizard state when component is created
@@ -411,6 +472,8 @@ export class SdrfWizardComponent implements OnInit {
   }
 
   onCancel(): void {
+    // Explicit dismiss — drop the draft so reopen starts clean. Chat text remains.
+    this.chatHistory.clearActiveWizard();
     this.wizardState.reset();
     this.cancel.emit();
   }
@@ -422,6 +485,7 @@ export class SdrfWizardComponent implements OnInit {
 
   onCreate(table: SdrfTable): void {
     this.complete.emit(table);
+    this.chatHistory.clearActiveWizard();
     this.wizardState.reset();
   }
 }

@@ -252,29 +252,44 @@ export function getDefaultMaterialType(
 }
 
 /**
- * A factor value column selected in the wizard.
+ * A study factor defined on Step 2 (candidates) and assigned per sample on Step 3.
  */
 export interface WizardFactor {
-  /** Factor name without wrapper, e.g. "disease" */
+  /** Factor name without wrapper, e.g. "disease" or "compound" → factor value[name] */
   name: string;
-  /** Characteristic to copy values from, e.g. "disease"; null for custom values */
-  sourceCharacteristic: string | null;
-  /** Default value when not copying from a characteristic */
-  defaultValue: string;
   /** Whether this factor is included in the generated table */
   enabled: boolean;
+  /** Candidate values filled on Step 2; Step 3 picks one per sample */
+  values: string[];
 }
 
 /**
- * Create a default disease factor from current characteristics.
+ * Create a default disease factor (candidates filled later on Step 2).
  */
 export function createDefaultDiseaseFactor(diseaseValue?: string): WizardFactor {
+  const values = diseaseValue?.trim() ? [diseaseValue.trim()] : [];
   return {
     name: 'disease',
-    sourceCharacteristic: 'disease',
-    defaultValue: diseaseValue || 'not available',
     enabled: true,
+    values,
   };
+}
+
+/** Normalize legacy factor drafts that used sourceCharacteristic / defaultValue. */
+export function normalizeFactor(raw: unknown): WizardFactor {
+  const record = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  const name = typeof record['name'] === 'string' ? record['name'].trim() : '';
+  const enabled = record['enabled'] === undefined ? true : record['enabled'] !== false;
+  const values: string[] = [];
+  if (Array.isArray(record['values'])) {
+    for (const v of record['values']) {
+      if (typeof v === 'string' && v.trim() && !values.includes(v.trim())) values.push(v.trim());
+    }
+  }
+  if (!values.length && typeof record['defaultValue'] === 'string' && record['defaultValue'].trim()) {
+    values.push(record['defaultValue'].trim());
+  }
+  return { name, enabled, values };
 }
 
 // ============ Ontology Term ============
@@ -318,6 +333,8 @@ export interface WizardSampleEntry {
   customCharacteristics?: Record<string, string>;
   /** Unified per-sample picks from Step2 choice lists (columnName -> value) */
   characteristicValues?: Record<string, string>;
+  /** Per-sample picks for study factors (factor.name -> value) */
+  factorValues?: Record<string, string>;
 }
 
 /**
@@ -1123,11 +1140,18 @@ export function parseFractionTechFromName(fileName: string): {
   technicalReplicate: number;
 } {
   const base = fileName.replace(/\.[^.]+$/, '');
+  // Prefer explicit fraction tags over pH (pH is often the fraction label in RP studies).
   const fractionMatch =
-    base.match(/(?:^|[_\-.])(?:f|fraction|slice)(\d+)/i) ||
-    base.match(/_F(\d+)(?:_|\.|$)/);
+    base.match(/(?:^|[_\-.])(?:fraction|slice)(\d+)/i) ||
+    base.match(/(?:^|[_\-.])Fr(\d+)(?:_|\.|$)/i) ||
+    base.match(/(?:^|[_\-.])FT(\d+)(?:_|\.|$)/i) ||
+    base.match(/_F(\d+)(?:_|\.|$)/) ||
+    base.match(/(?:^|[_\-.])f(\d+)(?:_|\.|$)/i) ||
+    base.match(/(?:^|[_\-.])pH(\d+)(?:_|\.|$)/i);
+  // Prefer tech/replicate tags; bare "repN" is often biological and left as tech=1 by callers.
   const techMatch =
-    base.match(/(?:^|[_\-.])(?:r|rep|tech|replicate)(\d+)/i) ||
+    base.match(/(?:^|[_\-.])(?:tech|technical)[_-]?(\d+)/i) ||
+    base.match(/(?:^|[_\-.])(?:r|replicate)(\d+)(?:_|\.|$)/i) ||
     base.match(/_R(\d+)(?:_|\.|$)/);
   return {
     fractionId: fractionMatch ? parseInt(fractionMatch[1], 10) : 1,
@@ -1415,7 +1439,7 @@ export interface WizardState {
   fileNamingPattern: string;
   dataFiles: WizardDataFile[];
 
-  // Step 7: Factor Values
+  // Factors (declared on Sample Values; emitted as factor value[…] columns)
   factors: WizardFactor[];
 }
 
@@ -1444,6 +1468,7 @@ export function createDefaultSample(index: number): WizardSampleEntry {
     index,
     sourceName: `sample_${index}`,
     biologicalReplicate: 1,
+    factorValues: {},
   };
 }
 
@@ -1507,7 +1532,7 @@ export function createEmptyWizardState(): WizardState {
     fileNamingPattern: '{sourceName}.raw',
     dataFiles: [],
 
-    // Step 7
+    // Factors
     factors: [createDefaultDiseaseFactor()],
   };
 }
@@ -1530,7 +1555,12 @@ export interface WizardStepConfig {
 export const WIZARD_STEPS: WizardStepConfig[] = [
   { id: 'setup', title: 'Experiment Setup', description: 'Select sample and technology templates', isRequired: true },
   { id: 'characteristics', title: 'Sample Characteristics', description: 'Define organism, disease, and tissue', isRequired: true },
-  { id: 'samples', title: 'Sample Values', description: 'Enter sample-specific information', isRequired: true },
+  {
+    id: 'samples',
+    title: 'Sample Values',
+    description: 'Names, replicates, per-sample values, and study factors',
+    isRequired: true,
+  },
   {
     id: 'runs-files',
     title: 'Runs & Files',
@@ -1538,6 +1568,5 @@ export const WIZARD_STEPS: WizardStepConfig[] = [
     isRequired: true,
   },
   { id: 'protocol', title: 'Instrument & Protocol', description: 'Instrument, enzyme, and modifications', isRequired: true },
-  { id: 'factors', title: 'Factor Values', description: 'Define experimental factors', isRequired: true },
   { id: 'review', title: 'Review & Create', description: 'Preview and generate SDRF', isRequired: true },
 ];

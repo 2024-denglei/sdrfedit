@@ -620,35 +620,12 @@ export class WizardGeneratorService {
     position: number
   ): SdrfColumn {
     const name = `factor value[${factor.name.trim()}]`;
-    let defaultValue = factor.defaultValue || 'not available';
-    let modifiers: Modifier[] = [];
-
-    if (factor.sourceCharacteristic === 'disease') {
-      defaultValue = this.termOrStringValue(state.disease, defaultValue);
-      modifiers = this.modsFromRows(row => {
-        const sample = this.findSample(state, row.sampleIndex);
-        if (sample?.disease) {
-          return typeof sample.disease === 'string'
-            ? sample.disease
-            : sample.disease.label.toLowerCase();
-        }
-        return defaultValue;
-      }, defaultValue).modifiers;
-    } else if (factor.sourceCharacteristic === 'organism part') {
-      defaultValue = this.termOrStringValue(state.organismPart, defaultValue);
-    } else if (factor.sourceCharacteristic === 'sex') {
-      defaultValue = state.defaultSex || defaultValue;
-      modifiers = this.modsFromRows(row => {
-        const sample = this.findSample(state, row.sampleIndex);
-        return sample?.sex || defaultValue;
-      }, defaultValue).modifiers;
-    } else if (factor.sourceCharacteristic === 'age') {
-      defaultValue = state.defaultAge || defaultValue;
-      modifiers = this.modsFromRows(row => {
-        const sample = this.findSample(state, row.sampleIndex);
-        return sample?.age || defaultValue;
-      }, defaultValue).modifiers;
-    }
+    const candidates = factor.values || [];
+    const defaultValue = candidates[0] || 'not available';
+    const modifiers = this.modsFromRows(row => {
+      const sample = this.findSample(state, row.sampleIndex);
+      return sample?.factorValues?.[factor.name]?.trim() || defaultValue;
+    }, defaultValue).modifiers;
 
     return {
       name,

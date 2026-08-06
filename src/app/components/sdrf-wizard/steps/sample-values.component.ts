@@ -23,13 +23,32 @@ import { WizardStateService } from '../../../core/services/wizard-state.service'
 import {
   WizardSampleEntry,
   WizardCharacteristicColumnMeta,
+  WizardFactor,
   CharacteristicChoice,
   parseCharacteristicInnerName,
   shouldShowOnSampleValuesStep,
   createDefaultSample,
+  normalizeFactor,
 } from '../../../core/models/wizard';
 
 type BioRepMode = 'sequential' | 'paired' | 'allOnes';
+
+interface BatchColumnOption {
+  key: string;
+  label: string;
+  kind: 'characteristic' | 'factor';
+  values: string[];
+}
+
+const FACTOR_BATCH_PREFIX = 'factor:';
+
+function isFactorBatchKey(key: string): boolean {
+  return key.startsWith(FACTOR_BATCH_PREFIX);
+}
+
+function factorNameFromBatchKey(key: string): string {
+  return key.slice(FACTOR_BATCH_PREFIX.length);
+}
 
 /** Split on commas, semicolons, tabs, and any whitespace (spaces / newlines). */
 function parseDelimitedTokens(text: string): string[] {
@@ -56,8 +75,8 @@ function parseBioRepNumbers(text: string): number[] {
       <div class="step-header">
         <h3>Sample-Specific Values</h3>
         <p class="step-description">
-          Set sample names and biological replicates first, then fill multi-choice columns
-          in the table (or use the batch shortcuts when you have many samples).
+          Set sample names and biological replicates, then assign multi-choice
+          characteristics and study factor values for each sample.
         </p>
       </div>
 
@@ -138,7 +157,7 @@ function parseBioRepNumbers(text: string): number[] {
         </div>
       </section>
 
-      @if (multiColumns().length > 0) {
+      @if (batchColumns().length > 0) {
         <section class="batch-panel">
           <div class="batch-title-row">
             <h4>Match values to samples</h4>
@@ -149,18 +168,18 @@ function parseBioRepNumbers(text: string): number[] {
             <div class="tri-col">
               <div class="tri-label">1. Column</div>
               <ul class="tri-list" role="listbox" aria-label="Columns with multiple values">
-                @for (col of multiColumns(); track col.name) {
+                @for (col of batchColumns(); track col.key) {
                   <li>
                     <button
                       type="button"
                       class="tri-item"
-                      [class.active]="batchColumn() === col.name"
-                      (click)="onBatchColumnChange(col.name)"
+                      [class.active]="batchColumn() === col.key"
+                      (click)="onBatchColumnChange(col.key)"
                       role="option"
-                      [attr.aria-selected]="batchColumn() === col.name"
+                      [attr.aria-selected]="batchColumn() === col.key"
                     >
-                      <span class="tri-item-name">{{ columnHeader(col) }}</span>
-                      <span class="tri-item-count">{{ choiceCount(col.name) }}</span>
+                      <span class="tri-item-name">{{ col.label }}</span>
+                      <span class="tri-item-count">{{ col.values.length }}</span>
                     </button>
                   </li>
                 }
@@ -171,21 +190,21 @@ function parseBioRepNumbers(text: string): number[] {
               <div class="tri-label">2. Values</div>
               @if (!batchColumn()) {
                 <p class="tri-empty">Pick a column on the left.</p>
-              } @else if (batchChoices().length === 0) {
+              } @else if (batchChoiceValues().length === 0) {
                 <p class="tri-empty">No values for this column.</p>
               } @else {
                 <ul class="tri-list" role="listbox" aria-label="Candidate values">
-                  @for (c of batchChoices(); track c.value) {
+                  @for (value of batchChoiceValues(); track value) {
                     <li>
                       <button
                         type="button"
                         class="tri-item value"
-                        [class.active]="batchValue() === c.value"
-                        (click)="selectBatchValue(c.value)"
+                        [class.active]="batchValue() === value"
+                        (click)="selectBatchValue(value)"
                         role="option"
-                        [attr.aria-selected]="batchValue() === c.value"
+                        [attr.aria-selected]="batchValue() === value"
                       >
-                        {{ c.value }}
+                        {{ value }}
                       </button>
                     </li>
                   }
@@ -231,10 +250,10 @@ function parseBioRepNumbers(text: string): number[] {
                         <span class="sample-pick-name">{{ sample.sourceName || ('sample_' + sample.index) }}</span>
                         <span
                           class="sample-pick-current"
-                          [class.same]="sampleValue(sample, batchColumn()) === batchValue()"
-                          [class.empty]="!sampleValue(sample, batchColumn())"
+                          [class.same]="batchSampleValue(sample) === batchValue()"
+                          [class.empty]="!batchSampleValue(sample)"
                         >
-                          {{ sampleValue(sample, batchColumn()) || '—' }}
+                          {{ batchSampleValue(sample) || '—' }}
                         </span>
                       </div>
                     </li>
@@ -291,6 +310,12 @@ function parseBioRepNumbers(text: string): number[] {
                   }
                 </th>
               }
+              @for (factor of enabledFactors(); track factor.name) {
+                <th class="col-override" [title]="'factor value[' + factor.name + ']'">
+                  {{ factor.name }}
+                  <span class="multi-tag factor">F</span>
+                </th>
+              }
               <th class="col-actions"></th>
             </tr>
           </thead>
@@ -332,11 +357,30 @@ function parseBioRepNumbers(text: string): number[] {
                         class="cell-select"
                         [ngModel]="sampleValue(sample, col.name)"
                         (ngModelChange)="setValue(i, col.name, $event)"
-                        (focus)="batchColumn.set(col.name)"
+                        (focus)="onBatchColumnChange(col.name)"
                       >
                         <option value="">Select…</option>
                         @for (c of choices(col.name); track c.value) {
                           <option [value]="c.value">{{ c.value }}</option>
+                        }
+                      </select>
+                    }
+                  </td>
+                }
+                @for (factor of enabledFactors(); track factor.name) {
+                  <td class="col-override">
+                    @if (factor.values.length <= 1) {
+                      <span class="readonly-value">{{ factorSampleValue(sample, factor.name) || '—' }}</span>
+                    } @else {
+                      <select
+                        class="cell-select"
+                        [ngModel]="factorSampleValue(sample, factor.name)"
+                        (ngModelChange)="setFactorValue(i, factor.name, $event)"
+                        (focus)="onBatchColumnChange(FACTOR_BATCH_PREFIX + factor.name)"
+                      >
+                        <option value="">Select…</option>
+                        @for (value of factor.values; track value) {
+                          <option [value]="value">{{ value }}</option>
                         }
                       </select>
                     }
@@ -360,7 +404,8 @@ function parseBioRepNumbers(text: string): number[] {
       @if (!wizardState.isStep3Valid()) {
         <div class="validation-message">
           <span class="warning-icon">!</span>
-          All samples need a source name; multi-candidate required columns must be selected for every sample.
+          All samples need a source name; multi-candidate required columns and
+          study factor values must be set for every sample.
         </div>
       }
     </div>
@@ -823,6 +868,7 @@ function parseBioRepNumbers(text: string): number[] {
       display: inline-block; margin-left: 4px; padding: 0 5px; border-radius: 999px;
       background: #dbeafe; color: #1d4ed8; font-size: 10px; font-weight: 600;
     }
+    .multi-tag.factor { background: #fef3c7; color: #92400e; }
     .required { color: #ef4444; }
     .remove-btn {
       border: none; background: transparent; color: #9ca3af; font-size: 18px; cursor: pointer;
@@ -840,6 +886,8 @@ function parseBioRepNumbers(text: string): number[] {
 })
 export class SampleValuesComponent implements OnInit {
   @Input() aiEnabled = false;
+
+  readonly FACTOR_BATCH_PREFIX = FACTOR_BATCH_PREFIX;
 
   readonly wizardState = inject(WizardStateService);
   readonly state = this.wizardState.state;
@@ -866,25 +914,47 @@ export class SampleValuesComponent implements OnInit {
     );
   });
 
-  readonly multiColumns = computed(() =>
-    this.displayColumns().filter(c => this.choiceCount(c.name) >= 2)
+  readonly enabledFactors = computed((): WizardFactor[] =>
+    (this.state().factors || []).map(normalizeFactor).filter(f => f.enabled && f.name.trim())
   );
 
-  readonly batchChoices = computed((): CharacteristicChoice[] => {
-    const col = this.batchColumn();
-    if (!col) return [];
-    return this.choices(col);
+  readonly batchColumns = computed((): BatchColumnOption[] => {
+    const cols: BatchColumnOption[] = this.displayColumns()
+      .filter(c => this.choiceCount(c.name) >= 2)
+      .map(c => ({
+        key: c.name,
+        label: this.columnHeader(c),
+        kind: 'characteristic' as const,
+        values: this.choices(c.name).map(choice => choice.value),
+      }));
+    for (const factor of this.enabledFactors()) {
+      if (factor.values.length < 2) continue;
+      cols.push({
+        key: FACTOR_BATCH_PREFIX + factor.name,
+        label: `factor: ${factor.name}`,
+        kind: 'factor',
+        values: [...factor.values],
+      });
+    }
+    return cols;
+  });
+
+  readonly batchChoiceValues = computed(() => {
+    const key = this.batchColumn();
+    return this.batchColumns().find(c => c.key === key)?.values || [];
   });
 
   ngOnInit(): void {
     this.wizardState.ensureSamplesInitialized();
+    this.wizardState.ensureDefaultFactors();
     if (!(this.state().characteristicColumns || []).length) {
       void this.wizardState.refreshCharacteristicColumns();
     }
     this.wizardState.syncCharacteristicAssignments();
-    const multi = this.multiColumns();
+    this.wizardState.syncFactorAssignments();
+    const multi = this.batchColumns();
     if (multi.length && !this.batchColumn()) {
-      this.onBatchColumnChange(multi[0].name);
+      this.onBatchColumnChange(multi[0].key);
     }
   }
 
@@ -904,8 +974,23 @@ export class SampleValuesComponent implements OnInit {
     return sample.characteristicValues?.[columnName] || '';
   }
 
+  factorSampleValue(sample: WizardSampleEntry, factorName: string): string {
+    return sample.factorValues?.[factorName] || '';
+  }
+
+  batchSampleValue(sample: WizardSampleEntry): string {
+    const key = this.batchColumn();
+    if (!key) return '';
+    if (isFactorBatchKey(key)) return this.factorSampleValue(sample, factorNameFromBatchKey(key));
+    return this.sampleValue(sample, key);
+  }
+
   setValue(sampleIndex: number, columnName: string, value: string): void {
     this.wizardState.setSampleCharacteristicValue(sampleIndex, columnName, value);
+  }
+
+  setFactorValue(sampleIndex: number, factorName: string, value: string): void {
+    this.wizardState.setSampleFactorValue(sampleIndex, factorName, value);
   }
 
   updateSample(index: number, field: keyof WizardSampleEntry, value: any): void {
@@ -941,6 +1026,7 @@ export class SampleValuesComponent implements OnInit {
     );
     this.wizardState.setSamples(next);
     this.wizardState.syncCharacteristicAssignments();
+    this.wizardState.syncFactorAssignments();
   }
 
   applyCustomBioReps(): void {
@@ -1082,7 +1168,7 @@ export class SampleValuesComponent implements OnInit {
 
   onBatchColumnChange(columnName: string): void {
     this.batchColumn.set(columnName);
-    const first = this.choices(columnName)[0]?.value || '';
+    const first = this.batchChoiceValues()[0] || '';
     this.selectBatchValue(first);
   }
 
@@ -1101,7 +1187,7 @@ export class SampleValuesComponent implements OnInit {
     }
     const next = new Set<number>();
     this.wizardState.samples().forEach((sample, i) => {
-      if (this.sampleValue(sample, col) === value) next.add(i);
+      if (this.batchSampleValue(sample) === value) next.add(i);
     });
     this.selectedIndices.set(next);
   }
@@ -1121,7 +1207,7 @@ export class SampleValuesComponent implements OnInit {
     if (!col) return;
     const next = new Set<number>();
     this.wizardState.samples().forEach((sample, i) => {
-      if (!this.sampleValue(sample, col)) next.add(i);
+      if (!this.batchSampleValue(sample)) next.add(i);
     });
     this.selectedIndices.set(next);
   }
@@ -1137,7 +1223,7 @@ export class SampleValuesComponent implements OnInit {
   }
 
   alternateExample(): string {
-    const vals = this.batchChoices().map(c => c.value);
+    const vals = this.batchChoiceValues();
     if (vals.length === 0) return '—';
     const n = Math.min(this.wizardState.samples().length || 4, 4);
     return Array.from({ length: n }, (_, i) => vals[i % vals.length]).join(' → ') +
@@ -1145,7 +1231,7 @@ export class SampleValuesComponent implements OnInit {
   }
 
   groupExample(): string {
-    const vals = this.batchChoices().map(c => c.value);
+    const vals = this.batchChoiceValues();
     if (vals.length === 0) return '—';
     const g = Math.max(1, this.groupSize());
     const n = Math.min(this.wizardState.samples().length || g * 2, g * 2);
@@ -1154,7 +1240,7 @@ export class SampleValuesComponent implements OnInit {
   }
 
   pastePlaceholder(): string {
-    const vals = this.batchChoices().map(c => c.value);
+    const vals = this.batchChoiceValues();
     const a = vals[0] || 'value_a';
     const b = vals[1] || 'value_b';
     return `${a}\n${b}\n${a}\n\n# or:\nsample_1\t${a}\nsample_2\t${b}`;
@@ -1166,24 +1252,32 @@ export class SampleValuesComponent implements OnInit {
 
   roundRobin(): void {
     const col = this.batchColumn();
-    if (col) this.wizardState.applyRoundRobin(col);
+    if (!col || isFactorBatchKey(col)) return;
+    this.wizardState.applyRoundRobin(col);
   }
 
   fillGroups(): void {
     const col = this.batchColumn();
-    if (col) this.wizardState.applyFillGroups(col, this.groupSize());
+    if (!col || isFactorBatchKey(col)) return;
+    this.wizardState.applyFillGroups(col, this.groupSize());
   }
 
   setSelected(): void {
     const col = this.batchColumn();
     const value = this.batchValue();
     if (!col || !value) return;
-    this.wizardState.applyToSelectedRows(col, value, [...this.selectedIndices()]);
+    const indices = [...this.selectedIndices()];
+    if (isFactorBatchKey(col)) {
+      const name = factorNameFromBatchKey(col);
+      for (const i of indices) this.wizardState.setSampleFactorValue(i, name, value);
+      return;
+    }
+    this.wizardState.applyToSelectedRows(col, value, indices);
   }
 
   applyPaste(): void {
     const col = this.batchColumn();
-    if (!col) return;
+    if (!col || isFactorBatchKey(col)) return;
     this.wizardState.applyPasteMapping(col, this.pasteText());
     this.pasteText.set('');
   }

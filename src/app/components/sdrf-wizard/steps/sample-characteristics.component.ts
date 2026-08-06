@@ -28,6 +28,7 @@ import {
 } from '../../../core/models/wizard';
 import { olsService } from '../../../core/services/ols.service';
 import { OntologySuggestion } from '../../../core/models/ontology';
+import { FactorValuesComponent } from './factor-values.component';
 
 function suggestionToTerm(s: OntologySuggestion): OntologyTerm {
   return {
@@ -42,14 +43,15 @@ function suggestionToTerm(s: OntologySuggestion): OntologyTerm {
 @Component({
   selector: 'wizard-sample-characteristics',
   standalone: true,
-  imports: [CommonModule, FormsModule],
+  imports: [CommonModule, FormsModule, FactorValuesComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="step-container">
       <div class="step-header">
         <h3>Sample Characteristics</h3>
         <p class="step-description">
-          Add one or more values for each characteristics column. A single value is applied to
+          Add one or more values for each characteristics column, then define study
+          factors and their group labels. A single characteristic value is applied to
           all samples; multiple values become dropdown choices on the next step.
         </p>
       </div>
@@ -98,10 +100,15 @@ function suggestionToTerm(s: OntologySuggestion): OntologyTerm {
         }
       </section>
 
+      <wizard-factor-values />
+
       @if (!wizardState.isStep2Valid()) {
         <div class="validation-message">
           <span class="warning-icon">!</span>
-          <div>Please add at least one candidate for each required characteristic to continue.</div>
+          <div>
+            Add at least one candidate for each required characteristic, and define
+            at least one study factor with candidate values.
+          </div>
         </div>
       }
     </div>
@@ -279,6 +286,7 @@ export class SampleCharacteristicsComponent implements OnInit {
   );
 
   ngOnInit(): void {
+    this.wizardState.ensureDefaultFactors();
     void this.loadColumns();
   }
 
