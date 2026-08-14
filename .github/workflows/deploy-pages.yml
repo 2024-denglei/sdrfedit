@@ -34,9 +34,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: npm
 
-      - run: npm ci
+      # package-lock.json is intentionally gitignored, so npm ci and
+      # setup-node's built-in cache (both need a lockfile) are not usable.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: npm-${{ runner.os }}-
+
+      - run: npm install --no-audit --no-fund
 
       - name: Build
         run: npx ng build --configuration production --base-href "$BASE_HREF"
