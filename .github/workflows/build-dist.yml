@@ -1,0 +1,50 @@
+name: Refresh committed dist
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'angular.json'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig*.json'
+  workflow_dispatch:
+
+# dist/ is committed so jsDelivr can serve the editor to
+# https://sdrf.quantms.org/sdrf-editor.html. Keeping it in sync by hand is
+# easy to forget, so rebuild and commit it here after every source change.
+permissions:
+  contents: write
+
+concurrency:
+  group: build-dist
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build
+        run: npx ng build --configuration production
+
+      - name: Commit dist if it changed
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add dist
+          if git diff --cached --quiet; then
+            echo 'dist/ is already up to date'
+            exit 0
+          fi
+          git commit -m 'chore: rebuild dist [skip ci]'
+          git push
