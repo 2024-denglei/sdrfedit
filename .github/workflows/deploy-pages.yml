@@ -13,8 +13,13 @@ on:
 # The published site is a preview of the editor. The copy embedded in
 # https://sdrf.quantms.org is served from dist/ over jsDelivr instead
 # (see build-dist.yml).
+#
+# GitHub Pages is HTTPS, so the assistant backend must also be HTTPS
+# (set repo variable/secret ASSISTANT_BASE_URL). Mixed content to
+# http://IP is blocked by the browser.
 env:
   BASE_HREF: ${{ github.event.inputs.base_href || '/sdrfedit/' }}
+  ASSISTANT_BASE_URL: ${{ vars.ASSISTANT_BASE_URL || secrets.ASSISTANT_BASE_URL || 'https://www.sdrf.site' }}
 
 permissions:
   contents: read
@@ -47,6 +52,27 @@ jobs:
 
       - name: Build
         run: npx ng build --configuration production --base-href "$BASE_HREF"
+
+      - name: Point the preview at the hosted assistant backend
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          url = (os.environ.get("ASSISTANT_BASE_URL") or "").strip().rstrip("/")
+          path = Path("dist/sdrf-editor/browser/index.html")
+          html = path.read_text(encoding="utf-8")
+          if not url:
+              print("ASSISTANT_BASE_URL is empty; leaving compiled default")
+              raise SystemExit(0)
+          snippet = f'<script>window.__SDRF_ASSISTANT_URL__ = {url!r};</script>'
+          needle = "<sdrf-editor></sdrf-editor>"
+          if needle not in html:
+              raise SystemExit("could not find <sdrf-editor> in index.html")
+          if "__SDRF_ASSISTANT_URL__" not in html:
+              html = html.replace(needle, needle + "\n  " + snippet, 1)
+              path.write_text(html, encoding="utf-8")
+          print(f"assistant backend: {url}")
+          PY
 
       - name: Add SPA fallback
         run: cp dist/sdrf-editor/browser/index.html dist/sdrf-editor/browser/404.html
