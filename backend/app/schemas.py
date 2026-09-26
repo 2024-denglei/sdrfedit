@@ -25,7 +25,6 @@ WizardStepId = Literal[
 # work out which step to guide the user to next.
 STEP_ORDER: list[WizardStepId] = [
     "setup",
-    "characteristics",
     "samples",
     "runs-files",
     "protocol",
@@ -35,7 +34,7 @@ STEP_ORDER: list[WizardStepId] = [
 STEP_TITLES: dict[WizardStepId, str] = {
     "setup": "Experiment Setup",
     "characteristics": "Sample Characteristics",
-    "samples": "Sample Values",
+    "samples": "Samples & Groups",
     "runs-files": "Runs & Files",
     "protocol": "Instrument & Protocol",
     "review": "Review & Create",
@@ -46,13 +45,17 @@ STEP_TITLES: dict[WizardStepId, str] = {
 ALLOWED_OPS: dict[str, WizardStepId] = {
     "setTechnologyTemplate": "setup",
     "setSampleTemplate": "setup",
+    "setSampleTemplates": "setup",
     "setExperimentTemplates": "setup",
     "setSampleCount": "setup",
     "setExperimentDescription": "setup",
-    "addCharacteristicChoice": "characteristics",
-    "setFactors": "characteristics",
-    "addFactor": "characteristics",
-    "addFactorValue": "characteristics",
+    "applyCharacteristicDraft": "samples",
+    "addCharacteristicChoice": "samples",
+    "setFactors": "samples",
+    "setNoStudyFactors": "samples",
+    "setRunFactorValue": "runs-files",
+    "addFactor": "samples",
+    "addFactorValue": "samples",
     "setSampleCharacteristicValue": "samples",
     "applyRoundRobin": "samples",
     "autoGenerateSourceNames": "samples",
@@ -62,6 +65,7 @@ ALLOWED_OPS: dict[str, WizardStepId] = {
     "setSampleFactorValue": "samples",
     "setLabelConfig": "runs-files",
     "autoPackSamplesIntoRuns": "runs-files",
+    "applyRunsFilesPlan": "runs-files",
     "replaceWithUnassignedFileNames": "runs-files",
     "assignDataFilesToRun": "runs-files",
     "assignFilesToRunsByName": "runs-files",
@@ -69,9 +73,13 @@ ALLOWED_OPS: dict[str, WizardStepId] = {
     "setFractionCount": "runs-files",
     "setTechnicalReplicates": "runs-files",
     "setAcquisitionMethod": "runs-files",
+    "setTemplateValue": "protocol",
     "setInstrument": "protocol",
+    "setProtocolValue": "protocol",
     "setCleavageAgent": "protocol",
     "setModifications": "protocol",
+    "setPrecursorMassTolerance": "protocol",
+    "setFragmentMassTolerance": "protocol",
 }
 
 # Reverse index of ALLOWED_OPS, so the prompt can show only the operations that
@@ -85,7 +93,7 @@ def next_step_after(step: WizardStepId | None) -> WizardStepId | None:
     """The step the user should move to once `step` is done."""
     if step is None:
         return None
-    index = STEP_ORDER.index(step)
+    index = STEP_ORDER.index("samples" if step == "characteristics" else step)
     return STEP_ORDER[index + 1] if index + 1 < len(STEP_ORDER) else None
 
 
@@ -152,6 +160,9 @@ class FactorInfo(BaseModel):
 
     name: str
     values: list[str] = Field(default_factory=list)
+    scope: Literal["sample", "run"] = "sample"
+    sourceCharacteristic: str | None = None
+    reasoning: str | None = None
 
 
 class MsRunSummary(BaseModel):
@@ -159,6 +170,11 @@ class MsRunSummary(BaseModel):
 
     name: str
     sampleSourceNames: list[str] = Field(default_factory=list)
+    labelConfigId: str | None = None
+    sampleMappingMode: Literal["separate", "pooled", "rows"] | None = None
+    channels: list[dict[str, Any]] = Field(default_factory=list)
+    files: list[dict[str, Any]] = Field(default_factory=list)
+    factorValues: dict[str, str] = Field(default_factory=dict)
 
 
 class WizardSnapshot(BaseModel):
@@ -167,6 +183,9 @@ class WizardSnapshot(BaseModel):
     currentStep: int = 0
     currentStepId: WizardStepId | None = None
     sampleTemplate: str | None = None
+    sampleMetadataTemplates: list[str] = Field(default_factory=list)
+    templateSnapshotId: str | None = None
+    selectedTemplates: list[dict[str, str]] = Field(default_factory=list)
     technologyTemplate: str | None = None
     experimentTemplates: list[str] = Field(default_factory=list)
     sampleCount: int = 0
@@ -174,10 +193,16 @@ class WizardSnapshot(BaseModel):
     # Prefer {name, requirement}; plain strings still accepted for older panels.
     characteristicColumns: list[CharacteristicColumnInfo | str] = Field(default_factory=list)
     characteristicChoices: dict[str, list[str]] = Field(default_factory=dict)
-    # Step 3 (Sample Values) live state — mirrors what the wizard asks the user to fill.
+    protocolColumns: list[dict[str, Any]] | None = None
+    genericProtocolFields: list[dict[str, Any]] = Field(default_factory=list)
+    protocolFields: dict[str, Any] = Field(default_factory=dict)
+    protocolIssues: list[str] = Field(default_factory=list)
+    # Step 2 (Samples & Groups) live state — mirrors what the wizard asks the user to fill.
     sampleSourceNames: list[str] = Field(default_factory=list)
+    sampleAssignments: list[dict[str, Any]] = Field(default_factory=list)
+    factorValues: dict[str, str] = Field(default_factory=dict)
     biologicalReplicates: list[int] = Field(default_factory=list)
-    # Characteristics columns that have 2+ candidates (shown as per-sample picks on Step 3).
+    # Characteristics columns that have 2+ candidates (shown as per-sample picks on Step 2).
     multiValueCharacteristicColumns: list[str] = Field(default_factory=list)
     labelConfigId: str | None = None
     msRunCount: int = 0
@@ -192,13 +217,23 @@ class WizardSnapshot(BaseModel):
     instrument: str | None = None
     cleavageAgent: str | None = None
     modifications: list[str] = Field(default_factory=list)
+    precursorMassTolerance: str = ""
+    fragmentMassTolerance: str = ""
     # Enabled factor names (legacy / short view).
     factors: list[str] = Field(default_factory=list)
     # Full factor definitions with Step-2 candidate values.
     factorDefinitions: list[FactorInfo] = Field(default_factory=list)
-    # Factors with 2+ candidates that need per-sample picks on Step 3.
+    factorDecision: Literal["pending", "none"] = "pending"
+    noFactorReason: str = ""
+    # Factors with 2+ candidates that need per-sample picks on Step 2.
     multiValueFactorColumns: list[str] = Field(default_factory=list)
     acquisitionMethod: str | None = None
+
+
+class AutomationReport(BaseModel):
+    status: Literal["ready", "blocked"]
+    issues: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
 
 class ChatRequest(BaseModel):
@@ -213,6 +248,7 @@ class ChatRequest(BaseModel):
     # "step" means the panel asked for this turn because the user moved to a new
     # wizard step; "chat" means the user typed something.
     mode: Literal["chat", "step"] = "chat"
+    executionMode: Literal["manual", "auto"] = "manual"
     # Named skill the panel resolved from a slash command (e.g. sdrf-annotate).
     skill: str | None = None
     skillArgs: str | None = None
@@ -227,6 +263,7 @@ class ChatResult(BaseModel):
     toolCalls: list[ToolInvocation] = Field(default_factory=list)
     nextStep: NextStepHint | None = None
     needsUserInput: str | None = None
+    automation: AutomationReport | None = None
     # Debug payload for the panel's downloadable agent trace.
     trace: dict[str, Any] | None = None
 

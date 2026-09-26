@@ -4,8 +4,8 @@
  * Chat surface docked beside the SDRF creation wizard. The backend does the
  * reasoning and tool calling; this component streams the reply, shows the
  * evidence behind it, and turns each proposed mutation into a card the user can
- * preview and apply. Nothing touches the wizard state until the user clicks
- * Apply.
+ * preview and apply. Automatic application is available only through the explicit
+ * Auto annotate action; ordinary chat remains manual.
  *
  * The assistant advises one wizard page at a time. It picks up the step the user
  * is on, and once that step is settled it offers to move on: clicking through, or
@@ -54,11 +54,17 @@ import {
   WizardActionError,
   WizardAiBridgeService,
 } from '../../core/services/assistant/wizard-ai-bridge.service';
+import { biologicalReplicateContract } from '../../core/services/assistant/wizard-action-args';
+import { WizardAutoAnnotationService } from '../../core/services/assistant/wizard-auto-annotation.service';
+import { orderAutoCards, type AutoTurn } from '../../core/utils/auto-annotation';
+import { buildActionRepairPrompt } from '../../core/services/assistant/wizard-action-repair';
 import { WizardStateService } from '../../core/services/wizard-state.service';
 import { resolveAssistantNavigation } from '../../core/utils/wizard-navigation';
 import { ActionCardListComponent } from './action-card-list.component';
-import { renderMarkdownLite } from './markdown-lite';
+import { MarkdownLitePipe } from './markdown-lite.pipe';
 import { ToolCallBlockComponent } from './tool-call-list.component';
+import { ActivityDisclosureComponent } from './activity-disclosure.component';
+import { appendThinking, finishThinking, recordThinking } from '../../core/utils/assistant-thinking';
 
 interface QuickStart {
   label: string;
@@ -76,7 +82,7 @@ const DEFAULT_WIDTH = 400;
 @Component({
   selector: 'wizard-ai-panel',
   standalone: true,
-  imports: [CommonModule, FormsModule, ToolCallBlockComponent, ActionCardListComponent],
+  imports: [CommonModule, FormsModule, ToolCallBlockComponent, ActionCardListComponent, ActivityDisclosureComponent, MarkdownLitePipe],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <aside class="ai-panel" [class.collapsed]="collapsed()" [style.width.px]="panelWidth()">
@@ -124,7 +130,7 @@ const DEFAULT_WIDTH = 400;
           >
             {{ collapsed() ? '&laquo;' : '&raquo;' }}
           </button>
-          <button class="icon-btn" (click)="close.emit()" title="Hide assistant">&times;</button>
+          <button class="icon-btn" [disabled]="autoAnnotation.active()" (click)="close.emit()" title="Hide assistant">&times;</button>
         </div>
       </header>
 
@@ -210,12 +216,14 @@ const DEFAULT_WIDTH = 400;
             </div>
           </div>
 
-          <div class="messages" #scroller>
+          <div class="messages" #scroller (scroll)="onMessagesScroll()"
+            (wheel)="onMessagesWheel($event)" (touchstart)="pauseFollowing()"
+            (keydown)="onMessagesKeydown($event)" tabindex="0" aria-label="Conversation">
             @if (messages().length === 0) {
               <div class="intro">
                 <p class="intro-title">I fill in this wizard with you, one page at a time.</p>
                 <p class="intro-body">
-                  Try <code>/sdrf-annotate PXD000547</code>, upload a paper PDF, or ask about
+                  Try <code>/sdrf-annotate PXD000547</code>, upload a paper or supplementary table, or ask about
                   the SDRF specification. Every suggestion comes with the evidence behind it.
                 </p>
                 <div class="quick-starts">
@@ -229,11 +237,86 @@ const DEFAULT_WIDTH = 400;
               </div>
             }
 
+            <section class="quick auto-annotation" aria-label="Automatic annotation">
+              <button class="auto-entry" type="button"
+                [attr.aria-expanded]="autoPxdExpanded()" aria-controls="auto-pxd-form"
+                (click)="autoPxdExpanded.set(!autoPxdExpanded())">
+                <span class="quick-label">Auto annotate a PXD dataset</span>
+                <span class="quick-hint">Enter a PXD ID and confirm to start automatic annotation</span>
+              </button>
+              @if (autoPxdExpanded()) {
+                <form id="auto-pxd-form" class="auto-pxd-form" (ngSubmit)="confirmAutoPxd()">
+                  <label for="auto-pxd-id">PXD ID</label>
+                  <div class="auto-pxd-input-row">
+                    <input id="auto-pxd-id" name="autoPxdId" type="text"
+                      [(ngModel)]="autoPxdId" (ngModelChange)="autoPxdError = ''"
+                      placeholder="PXD000547" autocomplete="off" spellcheck="false"
+                      [disabled]="busy()" [attr.aria-invalid]="!!autoPxdError"
+                      [attr.aria-describedby]="autoPxdError ? 'auto-pxd-error' : null" />
+                    <button class="btn-secondary" type="submit"
+                      [disabled]="!canStartAuto(autoPxdId.trim()) || !autoPxdId.trim()">Confirm and start</button>
+                  </div>
+                  @if (autoPxdError) {
+                    <span id="auto-pxd-error" class="auto-pxd-error" role="alert">{{ autoPxdError }}</span>
+                  }
+                </form>
+              }
+              @if (autoAnnotation.status() !== 'idle') {
+              <button class="auto-summary" type="button"
+                [attr.aria-expanded]="autoDetailsExpanded()" aria-controls="auto-annotation-details"
+                (click)="autoDetailsExpanded.set(!autoDetailsExpanded())">
+                <span aria-hidden="true">{{ autoDetailsExpanded() ? '▾' : '▸' }}</span>
+                <span>Auto annotation · {{ autoAnnotation.status() }}</span>
+                @if (autoAnnotation.issues().length) {
+                  <span class="auto-issue-count">{{ autoAnnotation.issues().length }} unresolved</span>
+                }
+                <span class="auto-summary-action">{{ autoDetailsExpanded() ? 'Collapse' : 'Expand' }}</span>
+              </button>
+              <div class="auto-controls">
+                @if (autoAnnotation.active()) {
+                  <button class="btn-secondary" [disabled]="autoAnnotation.stopping()" (click)="autoAnnotation.stop()">Stop auto annotation</button>
+                } @else {
+                  <button class="btn-secondary" [disabled]="!canStartAuto()" (click)="startAutoAnnotation()">Resume auto annotation</button>
+                }
+                @if (autoAnnotation.canUndo()) {
+                  <button class="btn-secondary" [disabled]="busy()" (click)="undoAutoAnnotation()">Undo auto annotation</button>
+                }
+                @if (autoAnnotation.downloadable()) {
+                  <button class="btn-secondary" (click)="autoAnnotation.download()">{{ autoAnnotation.status() === 'complete' ? 'Download SDRF' : 'Download draft' }}</button>
+                }
+              </div>
+              <div id="auto-annotation-details" [hidden]="!autoDetailsExpanded()" class="auto-details">
+              @if (autoAnnotation.status() === 'idle') {
+                <p>Use the experiment in your message, attached paper or current conversation. Auto annotate continues from the current step, checking earlier requirements, and applies new suggestions without card approval.</p>
+              } @else {
+                <p role="status" aria-live="polite">{{ autoAnnotation.resultChanged() ? 'Wizard changed since automatic annotation completed. Run again to generate and validate the latest values.' : autoAnnotation.progress() }}</p>
+                @if (autoAnnotation.active()) { <p>Wizard editing is paused during this run. Stop to return to manual editing.</p> }
+                @if (autoAnnotation.status() === 'complete' && !autoAnnotation.resultChanged()) { <p>Template validation passed; ontology lookup was skipped, as in the existing review workflow.</p> }
+                @if (autoAnnotation.issues().length) {
+                  <details open><summary>Unresolved items ({{ autoAnnotation.issues().length }})</summary>
+                    <ul>@for (issue of autoAnnotation.issues(); track $index) { <li>{{ issue }}</li> }</ul>
+                  </details>
+                }
+                @if (autoAnnotation.warnings().length) {
+                  <details><summary>Validation warnings ({{ autoAnnotation.warnings().length }})</summary>
+                    <ul>@for (warning of autoAnnotation.warnings(); track $index) { <li>{{ warning }}</li> }</ul>
+                  </details>
+                }
+                @if (autoAnnotation.notes().length) {
+                  <details><summary>Annotation notes ({{ autoAnnotation.notes().length }})</summary>
+                    <ul>@for (note of autoAnnotation.notes(); track $index) { <li>{{ note }}</li> }</ul>
+                  </details>
+                }
+              }
+              </div>
+              }
+            </section>
+
             @for (message of messages(); track $index) {
               @if (message.role === 'user') {
                 @if (message.auto) {
                   <div class="step-divider">
-                    <span>{{ message.content }}</span>
+                    <span>{{ message.autoLabel || message.content }}</span>
                   </div>
                 } @else if (message.attachment) {
                   <div class="user-row">
@@ -258,7 +341,7 @@ const DEFAULT_WIDTH = 400;
                             font-weight="700"
                             font-family="system-ui,sans-serif"
                           >
-                            PDF
+                            DOC
                           </text>
                         </svg>
                         @if (message.attachment.status === 'ready') {
@@ -273,7 +356,7 @@ const DEFAULT_WIDTH = 400;
                           <span class="file-status">{{ message.attachment.error || 'Parsing failed' }}</span>
                         } @else {
                           <span class="file-status">
-                            {{ message.attachment.sizeLabel || 'PDF' }}
+                            {{ message.attachment.sizeLabel || 'Document' }}
                             @if (message.attachment.parser) {
                               · {{ message.attachment.parser }}
                             }
@@ -310,26 +393,37 @@ const DEFAULT_WIDTH = 400;
                   }
 
                   @for (item of timelineOf(message); track item.id) {
-                    @if (item.kind === 'tool') {
+                    @if (item.kind === 'thinking') {
+                      <assistant-activity title="Thinking"
+                        [active]="!!message.pending && item.finishedAt === undefined"
+                        [meta]="thinkingDuration(item)">
+                        @if (item.reasoning) {
+                          <div class="markdown" [innerHTML]="item.reasoning | assistantMarkdown"></div>
+                        } @else {
+                          <div class="live">{{ item.finishedAt === undefined ? 'Waiting for reasoning content…' : 'No reasoning content was returned for this phase.' }}</div>
+                        }
+                      </assistant-activity>
+                    } @else if (item.kind === 'tool') {
                       <assistant-tool-block [call]="item.call" />
                     } @else if (item.kind === 'text' && item.content) {
-                      <div class="markdown" [innerHTML]="render(item.content)"></div>
+                      <div class="markdown" [innerHTML]="item.content | assistantMarkdown"></div>
                     }
                   }
 
-                  @if (message.pending && !message.content && !timelineOf(message).length && !message.status) {
-                    <div class="live"><span class="pulse"></span>Thinking</div>
-                  } @else if (message.status && !hasRunningTool(message)) {
-                    <div class="live"><span class="pulse"></span>{{ message.status }}</div>
+                  @if (message.pending && message.content && !message.status && !hasRunningTool(message)) {
+                    <assistant-activity title="Responding" [active]="true">
+                      <div class="live">Writing the response…</div>
+                    </assistant-activity>
                   }
 
                   @if (message.error) {
                     <div class="inline-error">{{ message.error }}</div>
                   }
 
-                  @if (cardsFor(message).length) {
+                  @if (!message.pending && cardsFor(message).length) {
                     <assistant-action-cards
                       [cards]="cardsFor(message)"
+                      [disabled]="autoAnnotation.active()"
                       (apply)="apply($event)"
                       (dismiss)="dismiss($event)"
                       (applyAll)="applyMany($event)"
@@ -357,9 +451,9 @@ const DEFAULT_WIDTH = 400;
                   @if (message.nextStep && !message.pending) {
                     <div class="next-bar">
                       <span class="next-text">
-                        Next: step {{ message.nextStep.index + 1 }}, {{ message.nextStep.title }}
+                        Next: {{ nextStepTitle(message.nextStep) }}
                       </span>
-                      <button class="next-btn" [disabled]="busy()" (click)="goNext(message.nextStep)">
+                      <button class="next-btn" [disabled]="busy() || !wizardState.canProceed()" (click)="goNext(message.nextStep)">
                         Continue &rarr;
                       </button>
                     </div>
@@ -369,6 +463,9 @@ const DEFAULT_WIDTH = 400;
             }
           </div>
 
+          @if (!followingLatest()) {
+            <button type="button" class="latest-btn" (click)="jumpToLatest()">↓ Back to latest</button>
+          }
           <div class="composer">
             @if (slashHintsVisible()) {
               <div class="slash-menu">
@@ -409,7 +506,7 @@ const DEFAULT_WIDTH = 400;
                           font-weight="700"
                           font-family="system-ui,sans-serif"
                         >
-                          PDF
+                          DOC
                         </text>
                       </svg>
                       <span class="composer-file-ok">✓</span>
@@ -423,7 +520,7 @@ const DEFAULT_WIDTH = 400;
                       <span class="composer-file-status">{{ file.error || 'Parsing failed' }}</span>
                     } @else {
                       <span class="composer-file-status">
-                        {{ file.sizeLabel || 'PDF' }}
+                        {{ file.sizeLabel || 'Document' }}
                         @if (file.parser) {
                           · {{ file.parser }}
                         }
@@ -459,10 +556,10 @@ const DEFAULT_WIDTH = 400;
                   (click)="fileInput.click()"
                   [title]="
                     api.health()?.mineruConfigured
-                      ? 'Attach PDF (parsed with MinerU)'
-                      : 'MinerU is not configured; paste the methods text instead'
+                      ? 'Attach paper or supplement (PDF, Excel, CSV, TSV, TXT, DOCX, ZIP)'
+                      : 'Attach Excel, CSV, TSV, TXT, DOCX or ZIP; PDF requires MinerU'
                   "
-                  aria-label="Attach PDF"
+                  aria-label="Attach paper or supplementary material"
                 >
                   <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
                     <path
@@ -502,7 +599,7 @@ const DEFAULT_WIDTH = 400;
             <input
               #fileInput
               type="file"
-              accept="application/pdf,.pdf"
+              accept=".pdf,.xlsx,.xls,.csv,.tsv,.txt,.docx,.zip"
               hidden
               (change)="onFileSelected($event)"
             />
@@ -512,6 +609,24 @@ const DEFAULT_WIDTH = 400;
     </aside>
   `,
   styles: [`
+    .auto-annotation { font-size: 12px; flex-shrink: 0; cursor: default; }
+    .intro + .auto-annotation { margin-top: -7px; }
+    .auto-entry { display: flex; flex-direction: column; gap: 2px; padding: 0; border: 0; background: transparent; text-align: left; font: inherit; line-height: 1.55; cursor: pointer; }
+    .auto-entry:focus-visible { outline: 2px solid #6366f1; outline-offset: 3px; border-radius: 3px; }
+    .auto-pxd-form { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+    .auto-pxd-input-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .auto-pxd-input-row input { flex: 1; min-width: 100px; width: 100px; padding: 6px 8px; border: 1px solid #d8dce5; border-radius: 6px; font: inherit; }
+    .auto-pxd-input-row input:focus-visible { outline: 2px solid #6366f1; outline-offset: 1px; }
+    .auto-pxd-error { color: #b91c1c; }
+    .auto-summary { display: flex; align-items: center; gap: 6px; width: 100%; padding: 0 0 8px; border: 0; background: transparent; color: #334155; font: inherit; text-align: left; cursor: pointer; }
+    .auto-summary:focus-visible { outline: 2px solid #6366f1; outline-offset: 2px; border-radius: 3px; }
+    .auto-summary-action { margin-left: auto; color: #4f46e5; }
+    .auto-issue-count { color: #92400e; }
+    .auto-details { max-height: min(180px, 25vh); overflow: auto; }
+    .auto-controls { display: flex; flex-wrap: wrap; gap: 6px; }
+    .auto-annotation p { margin: 6px 0 0; color: #475569; }
+    .auto-annotation details { margin-top: 6px; }
+    .auto-annotation ul { padding-left: 18px; }
     /*
      * The flex child of .wizard-shell is this host, not .ai-panel. Stretch the
      * host to the wizard's height so the panel doesn't float as a short card.
@@ -836,6 +951,10 @@ const DEFAULT_WIDTH = 400;
 
     /* ----------------------------------------------------------- messages */
 
+    .latest-btn { align-self: center; flex-shrink: 0; margin: 4px 0 8px; padding: 6px 12px;
+      border: 1px solid #d8dce5; border-radius: 16px; background: white; color: #4f46e5;
+      font: inherit; font-size: 12px; cursor: pointer; }
+    .latest-btn:focus-visible { outline: 2px solid #818cf8; outline-offset: 2px; }
     .messages {
       flex: 1;
       overflow-y: auto;
@@ -1369,11 +1488,21 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
   readonly api = inject(AssistantApiService);
   readonly history = inject(ChatHistoryService);
   private readonly bridge = inject(WizardAiBridgeService);
-  private readonly wizardState = inject(WizardStateService);
+  readonly wizardState = inject(WizardStateService);
+  readonly autoAnnotation = inject(WizardAutoAnnotationService);
+  readonly autoDetailsExpanded = signal(false);
+  readonly autoPxdExpanded = signal(false);
+  autoPxdId = '';
+  autoPxdError = '';
+  private viewGeneration = 0;
+  private requestSequence = 0;
 
   private readonly _messages = signal<AssistantChatMessage[]>([]);
   private readonly _cards = signal<Record<string, WizardActionCard>>({});
   private readonly _busy = signal(false);
+  readonly followingLatest = signal(true);
+  private scrollFrame: number | null = null;
+  private readonly timelineCache = new WeakMap<AssistantChatMessage, AssistantTimelineItem[]>();
   private readonly _collapsed = signal(false);
   private readonly _composerFile = signal<AssistantAttachment | null>(null);
   private readonly _width = signal(readStoredWidth());
@@ -1382,7 +1511,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
   private readonly _renamingId = signal<string | null>(null);
 
   readonly messages = this._messages.asReadonly();
-  readonly busy = this._busy.asReadonly();
+  readonly busy = computed(() => this._busy() || this.autoAnnotation.active());
   readonly collapsed = this._collapsed.asReadonly();
   readonly composerFile = this._composerFile.asReadonly();
   readonly panelWidth = this._width.asReadonly();
@@ -1444,7 +1573,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
     },
     {
       label: 'Annotate my own paper',
-      hint: 'Upload a PDF — MinerU parses it, then I advise this page',
+      hint: 'Upload a paper or supplementary table, then I advise this page',
       prompt: '',
     },
   ];
@@ -1475,6 +1604,10 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
   }
 
   ngOnDestroy(): void {
+    this.viewGeneration++;
+    this.autoAnnotation.stop();
+    this.api.abort();
+    if (this.scrollFrame !== null) cancelAnimationFrame(this.scrollFrame);
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
@@ -1512,6 +1645,11 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
       wizardSnapshot: this.bridge.buildSnapshot(),
       health: this.api.health(),
       cardSequence: this.cardSequence,
+      automation: {
+        status: this.autoAnnotation.status(), progress: this.autoAnnotation.progress(),
+        issues: this.autoAnnotation.issues(), notes: this.autoAnnotation.notes(),
+        warnings: this.autoAnnotation.warnings(),
+      },
       messages: this._messages().map(message => ({
         role: message.role,
         content: message.content,
@@ -1526,6 +1664,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
         nextStep: message.nextStep,
         actionIds: message.actionIds,
         trace: message.trace,
+        automation: message.automation,
         timeline: message.timeline,
         toolCalls: message.toolCalls,
       })),
@@ -1543,7 +1682,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
   }
 
   newChat(): void {
-    if (this._busy()) return;
+    if (this.busy()) return;
     this.persistActive();
     const session = this.history.create(createSessionId());
     this.loadSession(session.id);
@@ -1551,7 +1690,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
   }
 
   openChat(id: string): void {
-    if (this._busy() || id === this.history.activeId()) {
+    if (this.busy() || id === this.history.activeId()) {
       this._historyOpen.set(false);
       return;
     }
@@ -1561,7 +1700,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
   }
 
   deleteChat(id: string): void {
-    if (this._busy()) return;
+    if (this.busy()) return;
     const wasActive = id === this.history.activeId();
     this.history.remove(id);
     if (wasActive) {
@@ -1598,17 +1737,29 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
   }
 
   timelineOf(message: AssistantChatMessage): AssistantTimelineItem[] {
-    return migrateTimeline(message);
+    if (message.timeline?.length) return message.timeline;
+    let timeline = this.timelineCache.get(message);
+    if (!timeline) {
+      timeline = migrateTimeline(message);
+      this.timelineCache.set(message, timeline);
+    }
+    return timeline;
+  }
+
+  thinkingDuration(item: Extract<AssistantTimelineItem, { kind: 'thinking' }>): string {
+    if (item.finishedAt === undefined) return '';
+    const seconds = Math.max(0, (item.finishedAt - item.startedAt) / 1000);
+    return seconds < 60 ? `${seconds.toFixed(1)} s` : `${Math.floor(seconds / 60)} min ${Math.floor(seconds % 60)} s`;
   }
 
   hasRunningTool(message: AssistantChatMessage): boolean {
-    return migrateTimeline(message).some(
+    return this.timelineOf(message).some(
       item => item.kind === 'tool' && !!item.call.running
     );
   }
 
   canSend(): boolean {
-    if (this._busy()) return false;
+    if (this.busy()) return false;
     const file = this._composerFile();
     if (file?.status === 'parsing') return false;
     if (file?.status === 'ready') return true;
@@ -1622,6 +1773,12 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
   }
 
   private loadSession(id: string): void {
+    if (this.autoAnnotation.active()) return;
+    this.viewGeneration++;
+    this.autoAnnotation.clear();
+    this.autoPxdExpanded.set(false);
+    this.autoPxdId = '';
+    this.autoPxdError = '';
     const session = this.history.select(id);
     if (!session) return;
     this.loadingSession = true;
@@ -1634,6 +1791,12 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
       this._composerFile.set(null);
       this.queuedStep = null;
       this.restoreWizard(session);
+      if (!this.wizardState.getState().projectAccession) {
+        const projectMessage = [...session.messages].reverse().find(message =>
+          message.role === 'user' && /\bPXD\d+\b/i.test(message.content));
+        this.wizardState.setProjectAccession(projectMessage?.content);
+      }
+      this.followingLatest.set(true);
       this.scrollToBottom();
     } finally {
       this.loadingSession = false;
@@ -1682,10 +1845,6 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
       this.persistTimer = null;
       this.persistActive();
     }, 400);
-  }
-
-  render(text: string): string {
-    return renderMarkdownLite(text);
   }
 
   stepLabel(step: AssistantStepId): string {
@@ -1748,9 +1907,12 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
   }
 
   stop(): void {
+    if (this.autoAnnotation.active()) { this.autoAnnotation.stop(); return; }
+    this.requestSequence++;
     this.api.abort();
     this._busy.set(false);
-    this.patchLast(message => ({ ...message, pending: false, status: undefined }));
+    this.patchLast(message => ({ ...message, pending: false, status: undefined,
+      timeline: clearRunningTools(message.timeline || []) }));
     this.persistActive();
   }
 
@@ -1782,31 +1944,178 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
 
   // -------------------------------------------------------------- step driving
 
+  async confirmAutoPxd(): Promise<void> {
+    const accession = this.autoPxdId.trim().toUpperCase();
+    if (!/^PXD\d{6,}$/.test(accession)) {
+      this.autoPxdError = 'Enter a valid PXD ID, for example PXD000547.';
+      return;
+    }
+    const request = `/sdrf-annotate ${accession}`;
+    if (!this.canStartAuto(request)) return;
+    this.autoPxdId = accession;
+    this.autoPxdError = '';
+    this.autoPxdExpanded.set(false);
+    this.autoDetailsExpanded.set(true);
+    await this.startAutoAnnotation(request);
+  }
+
+  canStartAuto(initial = this.draft.trim()): boolean {
+    return !this.busy() && !this.applyingCard && this.composerFile()?.status !== 'parsing'
+      && (!!initial || this.composerFile()?.status === 'ready'
+        || this.messages().some(message => message.role === 'user')
+        || !!this.wizardState.getState().experimentDescription.trim() || !!this.accession());
+  }
+
+  async startAutoAnnotation(initial = this.draft.trim()): Promise<void> {
+    if (!this.canStartAuto(initial)) return;
+    const attachment = this.composerFile()?.status === 'ready' ? this.composerFile()! : undefined;
+    const slash = parseSlashCommand(initial);
+    const previousSkill = !initial ? [...this.messages()].reverse().find(message => message.skill)?.skill : undefined;
+    const sourceContext = initial || previousSkill?.args || '';
+    const accession = slash?.accession || sourceContext.match(/\bPXD\d+\b/i)?.[0]?.toUpperCase()
+      || this.wizardState.getState().projectAccession || this.accession();
+    this.wizardState.setProjectAccession(accession);
+    const skill = slash ? { name: slash.name, args: slash.args || undefined }
+      : previousSkill || (accession ? { name: 'sdrf-annotate', args: accession } : undefined);
+    const generation = this.viewGeneration;
+    this.draft = '';
+    this._composerFile.set(null);
+    this._slashHintsVisible.set(false);
+    this.queuedStep = null;
+    let first = true;
+    this.markAdvised(5);
+    await this.autoAnnotation.start({
+      abort: () => this.api.abort(),
+      request: async (step, runId) => {
+        if (generation !== this.viewGeneration) throw new Error('Conversation changed.');
+        const file = first ? attachment : undefined;
+        first = false;
+        const prompt = [initial ? `Annotation request: ${initial}` : '',
+          attachment ? `Use uploaded documentId ${attachment.documentId} (${attachment.fileName}).` : '',
+          `Automatically complete step ${step + 1}: ${WIZARD_STEPS[step].title}. Use current evidence and preserve correct existing values. Return actions and an automation completion report.`,
+        ].filter(Boolean).join('\n\n');
+        const result = await this.send(prompt, {
+          focusStep: WIZARD_STEPS[step].id as AssistantStepId, mode: 'step', auto: true,
+          autoLabel: `Auto annotation · Step ${step + 1}: ${WIZARD_STEPS[step].title}`,
+          attachment: file, skill, accession, automationRunId: runId,
+        });
+        if (!result) throw new Error('Could not start automatic assistant turn.');
+        return result;
+      },
+      repair: async (request, runId) => {
+        if (generation !== this.viewGeneration) throw new Error('Conversation changed.');
+        const result = await this.send(buildActionRepairPrompt(request), {
+          focusStep: request.card.action.step, mode: 'step', auto: true,
+          autoLabel: `Auto repair · ${request.card.action.label} · attempt ${request.attempt}/2`,
+          skill, accession, automationRunId: runId,
+        });
+        if (!result) throw new Error('Could not start automatic card repair.');
+        return result;
+      },
+      repairEvent: event => {
+        if (generation !== this.viewGeneration) return;
+        this._cards.update(map => {
+          const next = { ...map };
+          const original = next[event.request.card.id];
+          if (original) next[original.id] = {
+            ...original,
+            ...(event.status === 'accepted' ? { status: 'dismissed' as const, executionState: 'superseded' as const,
+              replacedByCardId: event.replacements[0].id } : {}),
+            repairHistory: [...(original.repairHistory || []), { attempt: event.request.attempt,
+              status: event.status, message: event.message, replacementIds: event.replacements.map(c => c.id) }],
+          };
+          for (const card of event.replacements) next[card.id] = {
+            ...(next[card.id] || card), replacesCardId: event.request.card.id,
+            ...(event.status === 'rejected' ? { status: 'dismissed' as const,
+              executionState: 'repair-rejected' as const, error: event.message } : {}),
+          };
+          return next;
+        });
+        this.persistActive();
+      },
+      record: (cards, applied, error, failure) => {
+        if (generation !== this.viewGeneration) return;
+        this._cards.update(map => {
+          const next = { ...map };
+          for (const card of cards) {
+            const isFailure = !applied && (!failure || failure.failedCardId === card.id);
+            const executionState = applied || isFailure ? undefined
+              : failure!.attemptedIds.includes(card.id) ? 'rolled-back' as const : 'not-executed' as const;
+            next[card.id] = {
+              ...(next[card.id] || card), status: applied ? 'applied' : isFailure ? 'failed' : 'pending', autoApplied: applied,
+              executionState, error: applied ? undefined : error,
+            };
+          }
+          return next;
+        });
+        this.persistActive();
+      },
+    });
+    if (generation === this.viewGeneration) {
+      this.queuedStep = null;
+      this._messages.update(messages => [...messages, {
+        role: 'assistant',
+        content: [this.autoAnnotation.progress(), ...this.autoAnnotation.issues(),
+          ...this.autoAnnotation.warnings().map(warning => `Warning: ${warning}`),
+          ...(this.autoAnnotation.notes().length
+            ? [`Annotation notes:\n${this.autoAnnotation.notes().map(note => `- ${note}`).join('\n')}`] : []),
+        ].join('\n\n'),
+      }]);
+      this.persistActive();
+    }
+  }
+
+  undoAutoAnnotation(): void {
+    if (this.busy()) return;
+    // Restoring the original step must not trigger a manual advisory request.
+    this.loadingSession = true;
+    const runId = this.autoAnnotation.undo();
+    if (runId) {
+      this._cards.update(map => Object.fromEntries(Object.entries(map).map(([id, card]) => [id,
+        card.automationRunId === runId ? { ...card, status: 'dismissed' as const, autoApplied: false, error: undefined } : card,
+      ])));
+      this.markAdvised(this.wizardState.currentStep());
+      this.persistActive();
+    }
+    this.loadingSession = false;
+  }
+
   /** The step strip button: advise on the page currently open. */
   adviseCurrentStep(): void {
     void this.adviseStep(this.wizardState.currentStep(), { force: true });
   }
 
   /** The "Continue" button under a turn: move the wizard on, then advise. */
+  nextStepIndex(hint: AssistantNextStep): number {
+    const id = hint.stepId === 'characteristics' ? 'samples' : hint.stepId;
+    return WIZARD_STEPS.findIndex(step => step.id === id);
+  }
+
+  nextStepTitle(hint: AssistantNextStep): string {
+    return WIZARD_STEPS[this.nextStepIndex(hint)]?.title || hint.title;
+  }
+
   goNext(hint: AssistantNextStep): void {
+    if (this.autoAnnotation.active()) return;
+    const targetStep = this.nextStepIndex(hint);
     const currentStep = this.wizardState.currentStep();
     const decision = resolveAssistantNavigation(
       currentStep,
-      hint.index,
+      targetStep,
       this.wizardState.canProceed(),
       this.totalSteps
     );
     if (decision === 'stay') return;
     if (decision === 'next') this.wizardState.nextStep();
-    else this.wizardState.goToStep(hint.index);
+    else this.wizardState.goToStep(targetStep);
     // The step effect picks the new step up, unless it was already advised.
-    void this.adviseStep(hint.index);
+    void this.adviseStep(targetStep);
   }
 
   private onStepChanged(step: number): void {
     // Nothing to advise on before the user has started a conversation: there is no
     // evidence yet, and an unprompted turn would just be noise.
-    if (this.loadingSession) return;
+    if (this.loadingSession || this.autoAnnotation.active()) return;
     if (this._messages().length === 0) return;
     if (this._advisedSteps().has(step)) return;
     if (this._busy()) {
@@ -1818,7 +2127,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
 
   private async adviseStep(step: number, options: { force?: boolean } = {}): Promise<void> {
     const config = WIZARD_STEPS[step];
-    if (!config || this._busy()) return;
+    if (!config || this.busy()) return;
     if (!options.force && this._advisedSteps().has(step)) return;
 
     await this.send(`Now help me with step ${step + 1}: ${config.title}.`, {
@@ -1840,14 +2149,20 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
       focusStep?: AssistantStepId;
       mode?: 'chat' | 'step';
       auto?: boolean;
+      autoLabel?: string;
       attachment?: AssistantAttachment;
       skill?: AssistantSkillRef;
       /** Prompt sent to the model when the UI shows a card/chip instead. */
       modelPrompt?: string;
       accession?: string | null;
+      automationRunId?: string;
     } = {}
-  ): Promise<void> {
-    if (this._busy()) return;
+  ): Promise<AutoTurn | undefined> {
+    if (this._busy() || (this.autoAnnotation.active() && !options.automationRunId)) return;
+    const generation = this.viewGeneration;
+    const requestSequence = ++this.requestSequence;
+    let automaticTurn: AutoTurn | undefined;
+    let streamError: string | undefined;
 
     // Pick up a ready file from the DeepSeek-style composer when the user hits Send.
     let attachment = options.attachment;
@@ -1864,7 +2179,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
 
     const raw = (text ?? this.draft).trim();
     const uploadPrompt = attachment
-      ? `I uploaded the paper "${attachment.fileName}" (documentId ${attachment.documentId}). ` +
+      ? `I uploaded the document "${attachment.fileName}" (documentId ${attachment.documentId}). ` +
         `Please call read_document on that documentId with sections ["methods","results"], then ` +
         `propose wizard actions for the page I am on.`
       : '';
@@ -1873,9 +2188,13 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
     const content =
       options.modelPrompt ||
       (attachment ? [uploadPrompt, raw].filter(Boolean).join('\n\n') : '') ||
-      slash?.prompt ||
       raw;
     if (!content && !attachment) return;
+    if (!options.automationRunId) {
+      this.wizardState.setProjectAccession(options.accession ?? slash?.accession
+        ?? raw.match(/\bPXD\d+\b/i)?.[0]
+        ?? this.wizardState.getState().projectAccession ?? this.accession());
+    }
 
     const stepIndex = options.focusStep
       ? WIZARD_STEPS.findIndex(config => config.id === options.focusStep)
@@ -1892,6 +2211,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
         role: 'user',
         content: content || uploadPrompt,
         auto: options.auto,
+        ...(options.autoLabel ? { autoLabel: options.autoLabel } : {}),
         attachment,
         skill,
       },
@@ -1899,7 +2219,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
         role: 'assistant',
         content: '',
         focusStep,
-        timeline: [],
+        timeline: recordThinking([], 'Waiting for the assistant’s next update…'),
         toolCalls: [],
         citations: [],
         actionIds: [],
@@ -1907,12 +2227,19 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
       },
     ]);
     this._busy.set(true);
+    this.followingLatest.set(true);
     this.markAdvised(stepIndex);
     this.scrollToBottom();
 
     const chatHistory = this._messages()
       .filter(message => !message.pending)
-      .map(message => ({ role: message.role, content: message.content }))
+      .map(message => {
+        const cards = (message.actionIds || []).map(id => this._cards()[id]).filter(Boolean);
+        const feedback = cards.length ? '\n\nAction execution feedback (application state):\n' + JSON.stringify(
+          cards.map(card => ({ op: card.action.op, args: card.action.args, status: card.status, error: card.error }))
+        ) : '';
+        return { role: message.role, content: message.content + feedback };
+      })
       .filter(message => message.content);
 
     try {
@@ -1920,17 +2247,24 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
         sessionId: this.sessionId,
         messages: chatHistory,
         wizardState: this.bridge.buildSnapshot(),
-        accession: options.accession ?? slash?.accession ?? this.accession(),
+        accession: options.accession ?? slash?.accession ?? this.wizardState.getState().projectAccession ?? this.accession(),
         focusStep,
         mode: options.mode || 'chat',
+        ...(options.automationRunId ? { executionMode: 'auto' as const } : {}),
         skill: skill?.name,
         skillArgs: skill?.args || slash?.args || null,
       });
 
       for await (const event of stream) {
+        if (generation !== this.viewGeneration || requestSequence !== this.requestSequence) break;
         switch (event.type) {
+          case 'thinking':
+            this.patchLast(message => ({ ...message,
+              timeline: appendThinking(message.timeline || [], event.text) }));
+            break;
           case 'status':
-            this.patchLast(message => ({ ...message, status: event.text }));
+            this.patchLast(message => ({ ...message, status: event.text,
+              timeline: recordThinking(message.timeline || [], event.text) }));
             break;
           case 'tool_start':
             this.patchLast(message => upsertTool(message, { ...event.tool, running: true }));
@@ -1942,7 +2276,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
             break;
           case 'token':
             this.patchLast(message => {
-              const timeline = appendText(message.timeline || [], event.text);
+              const timeline = appendText(finishThinking(message.timeline || []), event.text);
               return {
                 ...message,
                 status: undefined,
@@ -1952,7 +2286,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
             });
             break;
           case 'actions':
-            this.registerActions(event.actions);
+            if (!options.automationRunId) this.registerActions(event.actions);
             break;
           case 'citations':
             this.patchLast(message => ({ ...message, citations: event.citations }));
@@ -1961,6 +2295,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
             this.patchLast(message => ({ ...message, nextStep: event.nextStep }));
             break;
           case 'error':
+            streamError = event.text;
             this.patchLast(message => ({
               ...message,
               error: event.text,
@@ -1969,37 +2304,50 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
             }));
             break;
           case 'done':
+            if (options.automationRunId) {
+              automaticTurn = {
+                cards: this.registerActions(event.result.actions, options.automationRunId),
+                report: event.result.automation,
+              };
+            }
             this.patchLast(message => finalizeTurn(message, event.result));
             break;
         }
         this.scrollToBottom();
       }
     } finally {
-      this._busy.set(false);
-      this.patchLast(message => ({
-        ...message,
-        pending: false,
-        status: undefined,
-        timeline: clearRunningTools(message.timeline || []),
-      }));
-      this.persistActive();
-      this.scrollToBottom();
-      this.flushQueuedStep();
+      if (generation === this.viewGeneration && requestSequence === this.requestSequence) {
+        this._busy.set(false);
+        this.patchLast(message => ({
+          ...message,
+          pending: false,
+          status: undefined,
+          timeline: clearRunningTools(message.timeline || []),
+        }));
+        this.persistActive();
+        this.scrollToBottom();
+        this.flushQueuedStep();
+      }
     }
+    if (options.automationRunId && (streamError || !automaticTurn)) {
+      throw new Error(streamError || 'Assistant stream ended before completion; no actions were applied.');
+    }
+    return automaticTurn;
   }
 
   private flushQueuedStep(): void {
     const step = this.queuedStep;
     this.queuedStep = null;
-    if (step !== null && step === this.wizardState.currentStep()) void this.adviseStep(step);
+    if (!this.autoAnnotation.active() && step !== null && step === this.wizardState.currentStep()) void this.adviseStep(step);
   }
 
-  private registerActions(actions: WizardAction[]): void {
-    if (!actions.length) return;
+  private registerActions(actions: WizardAction[], automationRunId?: string): WizardActionCard[] {
+    if (!actions.length) return [];
 
     const created: WizardActionCard[] = actions.map(action => ({
       id: `action_${++this.cardSequence}`,
       action,
+      ...(automationRunId ? { automationRunId } : {}),
       status: 'pending',
       preview: this.bridge.previewAction(action),
     }));
@@ -2014,6 +2362,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
       actionIds: [...(message.actionIds || []), ...created.map(card => card.id)],
     }));
     this.persistActive();
+    return created;
   }
 
   private patchLast(update: (message: AssistantChatMessage) => AssistantChatMessage): void {
@@ -2028,51 +2377,89 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
   }
 
   private scrollToBottom(): void {
-    // Runs after the current change detection pass has rendered the new content.
-    setTimeout(() => {
+    if (!this.followingLatest() || this.scrollFrame !== null) return;
+    // Coalesce stream events into one scroll per frame, and respect user input
+    // even when it arrives after this callback was scheduled.
+    this.scrollFrame = requestAnimationFrame(() => {
+      this.scrollFrame = null;
+      if (!this.followingLatest()) return;
       const element = this.scroller()?.nativeElement;
       if (element) element.scrollTop = element.scrollHeight;
     });
   }
 
-  // ------------------------------------------------------------------- cards
+  pauseFollowing(): void { this.followingLatest.set(false); }
 
-  /**
-   * Memoised so each turn keeps a stable array reference between change detection
-   * passes; a fresh array every pass would churn the child component's input.
-   */
-  private readonly cardsByMessage = computed(() => {
-    const map = this._cards();
-    const grouped = new Map<AssistantChatMessage, WizardActionCard[]>();
-    for (const message of this._messages()) {
-      if (message.role !== 'assistant' || !message.actionIds?.length) continue;
-      const cards = message.actionIds
-        .map(id => map[id])
-        .filter((card): card is WizardActionCard => !!card);
-      if (cards.length) grouped.set(message, cards);
-    }
-    return grouped;
-  });
-
-  cardsFor(message: AssistantChatMessage): WizardActionCard[] {
-    return this.cardsByMessage().get(message) || NO_CARDS;
+  onMessagesWheel(event: WheelEvent): void {
+    if (event.deltaY < 0) this.pauseFollowing();
   }
 
+  onMessagesKeydown(event: KeyboardEvent): void {
+    if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) this.pauseFollowing();
+  }
+
+  onMessagesScroll(): void {
+    const element = this.scroller()?.nativeElement;
+    if (!element) return;
+    this.followingLatest.set(element.scrollHeight - element.scrollTop - element.clientHeight <= 24);
+  }
+
+  jumpToLatest(): void {
+    this.followingLatest.set(true);
+    this.scrollToBottom();
+  }
+
+  // ------------------------------------------------------------------- cards
+
+  // Streamed text does not change actionIds or card objects. Preserve the input
+  // array so completed cards remain untouched while another message streams.
+  private readonly cardListCache = new WeakMap<string[], WizardActionCard[]>();
+
+  cardsFor(message: AssistantChatMessage): WizardActionCard[] {
+    const ids = message.actionIds;
+    if (message.pending || !ids?.length) return NO_CARDS;
+    const map = this._cards();
+    const cached = this.cardListCache.get(ids);
+    if (cached && cached.length === ids.length && cached.every((card, index) => card === map[ids[index]])) {
+      return cached;
+    }
+    const cards = ids.map(id => map[id]).filter((card): card is WizardActionCard => !!card);
+    this.cardListCache.set(ids, cards);
+    return cards;
+  }
+
+  private applyingCard = false;
+
   async apply(card: WizardActionCard): Promise<void> {
+    if (this.applyingCard || this.autoAnnotation.active()) return;
+    if (card.executionState === 'superseded' || card.executionState === 'repair-rejected') return;
+    if (card.status === 'failed') {
+      const contract = card.action.op === 'setBiologicalReplicates'
+        ? biologicalReplicateContract(this.wizardState.getState().sampleCount) : '';
+      await this.send(`Repair the failed suggestion "${card.action.label}" using the CURRENT wizard snapshot. Error: ${card.error || 'application failed'}. Original action: ${JSON.stringify(card.action)}. ${contract} Propose a corrected plan; do not repeat references to missing groups.`, { focusStep: card.action.step });
+      return;
+    }
+    this.applyingCard = true;
     const preview = this.bridge.previewAction(card.action);
     try {
       await this.bridge.applyAction(card.action);
-      this.updateCard(card.id, { status: 'applied', preview, error: undefined });
+      this.updateCard(card.id, { status: 'applied', preview, error: undefined, executionState: undefined });
+      this.autoAnnotation.recordManualApplication(card.action.step,
+        !Object.values(this._cards()).some(other => other.action.step === card.action.step
+          && (other.status === 'pending' || other.status === 'failed')));
     } catch (error) {
       const message =
         error instanceof WizardActionError || error instanceof Error
           ? error.message
           : 'Could not apply this suggestion.';
-      this.updateCard(card.id, { status: 'failed', preview, error: message });
+      this.updateCard(card.id, { status: 'failed', preview, error: message, executionState: undefined });
+    } finally {
+      this.applyingCard = false;
     }
   }
 
   dismiss(card: WizardActionCard): void {
+    if (this.autoAnnotation.active()) return;
     this.updateCard(card.id, { status: 'dismissed', preview: this.bridge.previewAction(card.action) });
   }
 
@@ -2097,8 +2484,9 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
   }
 
   async applyMany(cards: WizardActionCard[]): Promise<void> {
-    for (const card of cards) {
+    for (const card of orderAutoCards(cards)) {
       if (this._cards()[card.id]?.status === 'pending') await this.apply(card);
+      if (this._cards()[card.id]?.status === 'failed') break;
     }
   }
 
@@ -2117,13 +2505,13 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
     const input = event.target as HTMLInputElement;
     const file = input.files?.[0];
     input.value = '';
-    if (!file || this._busy() || this._composerFile()?.status === 'parsing') return;
+    if (!file || this.busy() || this._composerFile()?.status === 'parsing') return;
 
     const sizeLabel = formatFileSizeLabel(file);
     this._composerFile.set({
       fileName: file.name,
       documentId: '',
-      parser: 'MinerU',
+      parser: file.name.toLowerCase().endsWith('.pdf') ? 'MinerU' : 'Supplement parser',
       sections: [],
       charCount: 0,
       sizeLabel,
@@ -2146,7 +2534,7 @@ export class WizardAiPanelComponent implements OnInit, OnDestroy {
       this._composerFile.set({
         fileName: file.name,
         documentId: '',
-        parser: 'MinerU',
+        parser: file.name.toLowerCase().endsWith('.pdf') ? 'MinerU' : 'Supplement parser',
         sections: [],
         charCount: 0,
         sizeLabel,
@@ -2177,7 +2565,7 @@ function upsertTool(
   call: AssistantToolCall
 ): AssistantChatMessage {
   if (!call?.id) return { ...message, status: undefined };
-  const timeline = [...(message.timeline || [])];
+  const timeline = finishThinking(message.timeline || []);
   const index = timeline.findIndex(item => item.kind === 'tool' && item.call.id === call.id);
   const item: AssistantTimelineItem = { kind: 'tool', id: call.id, call };
   if (index >= 0) {
@@ -2194,7 +2582,7 @@ function upsertTool(
 }
 
 function clearRunningTools(timeline: AssistantTimelineItem[]): AssistantTimelineItem[] {
-  return timeline.map(item =>
+  return finishThinking(timeline).map(item =>
     item.kind === 'tool' && item.call.running
       ? { ...item, call: { ...item.call, running: false } }
       : item
@@ -2227,6 +2615,7 @@ function finalizeTurn(
     toolCalls: AssistantToolCall[];
     nextStep: AssistantNextStep | null;
     trace?: Record<string, unknown> | null;
+    automation?: AssistantChatMessage['automation'];
   }
 ): AssistantChatMessage {
   let timeline = mergeToolsFromResult(message.timeline || [], result.toolCalls);
@@ -2244,6 +2633,7 @@ function finalizeTurn(
     citations: result.citations.length ? result.citations : message.citations,
     nextStep: result.nextStep || message.nextStep,
     trace: result.trace ?? message.trace ?? null,
+    ...(result.automation ? { automation: result.automation } : {}),
   };
 }
 

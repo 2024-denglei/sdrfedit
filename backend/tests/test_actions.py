@@ -121,10 +121,10 @@ def test_sample_value_ops_are_on_samples_step():
     assert "factors" not in set(ALLOWED_OPS.values())
 
 
-def test_factor_definition_ops_are_on_characteristics_step():
-    assert ALLOWED_OPS["setFactors"] == "characteristics"
-    assert ALLOWED_OPS["addFactor"] == "characteristics"
-    assert ALLOWED_OPS["addFactorValue"] == "characteristics"
+def test_factor_definition_ops_are_on_merged_samples_step():
+    assert ALLOWED_OPS["setFactors"] == "samples"
+    assert ALLOWED_OPS["addFactor"] == "samples"
+    assert ALLOWED_OPS["addFactorValue"] == "samples"
 
 
 def test_assign_files_by_name_op_is_on_runs_files_step():
@@ -141,7 +141,7 @@ def test_actions_outside_the_focus_step_are_deferred():
         _payload(
             [
                 {"op": "setSampleTemplate", "argsJson": '["human"]', "label": "Human samples"},
-                {"op": "setInstrument", "argsJson": '[{"id":"MS:1","label":"x"}]', "label": "Instrument"},
+                {"op": "setInstrument", "argsJson": '[{"id":"MS:1001911","label":"x"}]', "label": "Instrument"},
             ]
         ),
         focus_step="setup",
@@ -157,7 +157,7 @@ def test_no_focus_step_keeps_every_step():
         _payload(
             [
                 {"op": "setSampleTemplate", "argsJson": '["human"]', "label": "Human samples"},
-                {"op": "setInstrument", "argsJson": '[{"id":"MS:1","label":"x"}]', "label": "Instrument"},
+                {"op": "setInstrument", "argsJson": '[{"id":"MS:1001911","label":"x"}]', "label": "Instrument"},
             ]
         )
     )
@@ -189,7 +189,7 @@ def test_focus_step_falls_back_to_where_the_user_is():
 def test_next_step_hint_points_at_the_following_page():
     hint = _next_step_hint("characteristics", proposed_actions=True, mode="chat")
     assert hint is not None
-    assert hint.stepId == "samples"
+    assert hint.stepId == "runs-files"
     assert hint.index == 2
     assert "step 3" in hint.prompt
 
@@ -207,29 +207,32 @@ def test_next_step_hint_stops_at_the_last_page():
 # --------------------------------------------------------- evidence digests
 
 
-def test_pride_result_becomes_replayable_evidence():
+def test_pride_metadata_and_raw_files_are_separate_tools():
+    tools = {tool["declaration"]["name"]: tool for tool in registry.TOOLS}
+
+    assert "get_pride_metadata" in tools
+    assert "get_pride_raw_files" in tools
+    assert "get_pride_dataset" not in tools
+    assert "Does not fetch raw files" in tools["get_pride_metadata"]["declaration"]["description"]
+
+
+def test_pride_result_does_not_become_lossy_evidence_note():
     note = _evidence_note(
-        "get_pride_dataset",
+        "get_pride_metadata",
         {
             "accession": "PXD000547",
             "title": "TMT time course",
             "organisms": ["Homo sapiens (9606)"],
             "instruments": ["Q Exactive (MS:1001911)"],
-            "files": {"rawFileCount": 40, "rawFileNames": ["a.raw", "b.raw"]},
             "references": [{"pubmedId": "24006456"}],
         },
     )
 
-    assert note is not None
-    key, text = note
-    assert key == "pride:PXD000547"
-    assert "Homo sapiens" in text
-    assert "40" in text
-    assert "PMID 24006456" in text
+    assert note is None
 
 
 def test_failed_tool_leaves_no_evidence():
-    assert _evidence_note("get_pride_dataset", {"error": "boom"}) is None
+    assert _evidence_note("get_pride_metadata", {"error": "boom"}) is None
     assert _evidence_note("find_publication", {"found": False}) is None
     assert _evidence_note("search_ontology", {"terms": []}) is None
 
@@ -247,7 +250,7 @@ def test_tool_summary_reads_as_a_sentence():
 
 
 def test_tool_error_is_flagged_for_attention():
-    summary, ok = registry.describe("get_pride_dataset", {"error": "404 Not Found\nsecond line"})
+    summary, ok = registry.describe("get_pride_metadata", {"error": "404 Not Found\nsecond line"})
     assert not ok
     assert summary == "Failed: 404 Not Found"
 
@@ -264,6 +267,13 @@ def test_every_tool_has_a_title_and_summarizer():
         name = tool["declaration"]["name"]
         assert tool.get("title"), f"{name} has no display title"
         assert callable(tool.get("summarize")), f"{name} has no summarizer"
+
+
+def test_document_list_title_covers_every_document_source():
+    tool = next(tool for tool in registry.TOOLS if tool["declaration"]["name"] == "list_documents")
+
+    assert tool["title"] == "Available documents"
+    assert "uploads, pasted text, and retrieved articles" in tool["declaration"]["description"]
 
 
 # ------------------------------------------------------------------ citations
@@ -289,14 +299,68 @@ def test_spec_search_results_become_citations():
 
 
 def test_failed_tool_result_yields_no_citations():
-    assert _citations_from_tool("get_pride_dataset", {"error": "boom"}) == []
-    assert _citations_from_tool("get_pride_dataset", "not json") == []
+    assert _citations_from_tool("get_pride_metadata", {"error": "boom"}) == []
+    assert _citations_from_tool("get_pride_metadata", "not json") == []
 
 
 def test_pride_result_becomes_citation():
     citations = _citations_from_tool(
-        "get_pride_dataset",
+        "get_pride_metadata",
         {"accession": "PXD000001", "title": "TMT spikes", "url": "https://example.org/PXD000001"},
     )
     assert citations[0].source == "pride"
     assert citations[0].url == "https://example.org/PXD000001"
+
+
+def test_merged_sample_page_accepts_definitions_and_assignments_together():
+    actions, rejected, deferred = _parse_actions(json.dumps({"actions": [
+        {"op": "addCharacteristicChoice", "argsJson": '["characteristics[disease]", "normal"]'},
+        {"op": "setFactors", "argsJson": '[[{"name":"treatment","enabled":true,"values":["control","treated"]}]]'},
+        {"op": "setSourceNames", "argsJson": '[["sample_1", "sample_2"]]'},
+        {"op": "setFactorColumnValues", "argsJson": '["treatment", ["control", "treated"]]'},
+    ]}), focus_step="samples")
+    assert not rejected and not deferred
+    assert len(actions) == 4
+    assert all(action.step == "samples" for action in actions)
+
+
+def test_legacy_characteristics_focus_restores_the_merged_page():
+    request = ChatRequest(sessionId="s", messages=[], focusStep="characteristics")
+    assert resolve_focus_step(request) == "samples"
+
+
+def test_biological_replicate_trace_failures_rejected_before_cards():
+    malformed = [
+        [['pooled'] * 8], [1] * 8, [list(range(8))],
+        [list(range(8)), 1], [list(range(8)), [1] * 8],
+        [[1] * 7], [[True] * 8], [[1.5] * 8], [['1'] * 8],
+        [[1] * 8, 1], [[9007199254740992] * 8],
+    ]
+    for args in malformed:
+        actions, rejected, deferred = _parse_actions(_payload([
+            {'op': 'setBiologicalReplicates', 'argsJson': json.dumps(args)}
+        ]), 'samples', sample_count=8)
+        assert actions == [], args
+        assert deferred == []
+        assert len(rejected) == 1
+        assert 'not sample indices' in rejected[0]
+        assert '[[1,1,1,1,1,1,1,1]]' in rejected[0]
+
+
+def test_biological_replicate_correction_preserves_requested_values():
+    for values in [[1] * 8, [1, 1, 1, 1, 2, 2, 2, 2]]:
+        actions, rejected, deferred = _parse_actions(_payload([
+            {'op': 'setBiologicalReplicates', 'argsJson': json.dumps([values])}
+        ]), 'samples', sample_count=8)
+        assert rejected == deferred == []
+        assert actions[0].args == [values]
+
+
+def test_import_gets_verified_urls_even_when_model_omits_them():
+    from app.llm.agent import _attach_file_urls
+    actions, _, _ = _parse_actions(_payload([
+        {'op': 'replaceWithUnassignedFileNames', 'argsJson': '[["a.raw","b.raw"]]'}
+    ]), 'runs-files')
+    enriched = _attach_file_urls(actions, {'a.raw': 'ftp://example.org/a.raw', 'other.raw': 'ftp://example.org/other.raw'})
+    assert enriched[0].args == [['a.raw', 'b.raw'], {'a.raw': 'ftp://example.org/a.raw'}]
+    assert actions[0].args == [['a.raw', 'b.raw']]

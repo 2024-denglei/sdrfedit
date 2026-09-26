@@ -15,11 +15,19 @@ a list of **wizard actions** the frontend can apply after the user approves them
 |---|---|
 | Chat orchestration with tool calling | `app/llm/agent.py`, OpenAI-compatible streaming client in `app/llm/client.py` |
 | SDRF specification Q&A (RAG) | `app/rag/` — chunked specification + embeddings, hybrid retrieval |
-| PXD dataset metadata + raw file list | `app/tools/pride.py` (PRIDE Archive v3) |
+| PXD dataset metadata + raw file list | `app/tools/pride.py` (PRIDE Archive v3); full project metadata and complete RAW names/URLs cached per session/accession and replayed on later turns without evidence summaries or output truncation |
+| Optional PRIDE technical evidence | `app/tools/pride_technical.py` — discovered file IDs, bounded mzTab/mzIdentML/mqpar extraction, session cache and paginated provenance |
 | Paper retrieval | `app/tools/literature.py` (Europe PMC search + JATS full text) |
 | Paywalled papers | `app/parsing/` — MinerU, plus `POST /api/uploads/pdf` for user-supplied PDFs |
 | Verified ontology terms | `app/tools/ontology.py` (EBI OLS4) |
 | Template layers and columns | `app/tools/templates.py` (bigbio/sdrf-templates) |
+
+Technical evidence is requested when protocol parameters lack supporting evidence,
+sources conflict, the user requests verification, or a file-to-analysis association
+is unresolved. Existing sufficient evidence is reused. Source URLs are restricted
+to the current discovered PRIDE project; arbitrary paths/URLs are not exposed to
+the model. Optional extraction failures do not by themselves block annotation.
+See [technical metadata usage and limits](scripts/TECHNICAL_METADATA.md).
 
 ## Setup
 
@@ -185,3 +193,110 @@ rule behind a column before suggesting a value for it.
 python -m pytest tests -q          # unit tests, no network or API keys needed
 python scripts/smoke_tools.py      # exercises PRIDE / OLS / Europe PMC / templates (network)
 ```
+
+
+### Publication acquisition
+
+PRIDE references are resolved using PMID (restricted to MED records), then normalized
+DOI. Conflicting identifiers require clarification; title-only matches are candidates.
+The assistant reuses matching session documents, otherwise downloads Europe PMC JATS
+XML first. XML is stored as a `documentId`, just like PDFs parsed through MinerU, and
+can be read with `read_document`. Tables and supplementary-file references are retained;
+supplementary attachments themselves are not automatically downloaded in this version.
+
+If XML is unavailable or fails, Europe PMC PDF candidates are tried first. After
+those fail, the assistant calls `find_publication` with the DOI and
+`useFallback=true` to discover a Sci-Hub PDF, then passes its URL and DOI to
+`parse_pdf_url`. Normal publication lookup does not contact Sci-Hub. Unpaywall is
+no longer used. `SCIHUB_BASE_URL` defaults to `https://www.sci-hub.ee/`; set it to
+another mirror base URL or leave it empty to disable fallback. Restart the backend
+after changing environment configuration.
+
+Sci-Hub requests default to direct connections (`SCIHUB_TRUST_ENV=false`), ignoring
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and other HTTPX environment settings only
+for its discovery requests and discovered PDF downloads. The backend records the
+exact discovered URL per session, so PDFs on separate CDN domains and their redirects
+use the same policy without relying on the model to pass a proxy flag. PDF reachability
+checks use this policy too. Other sources, LLM calls, and MinerU keep their existing
+proxy behavior; no global environment variables or system proxy settings are changed.
+Set `SCIHUB_TRUST_ENV=true` to restore environment-based networking for Sci-Hub.
+TLS certificate verification remains enabled. Because HTTPX's `trust_env=false` also
+ignores `SSL_CERT_FILE`/`SSL_CERT_DIR`, direct mode uses the library's default trust store.
+This bypasses environment proxies, not an OS-level VPN/TUN or transparent proxy.
+
+Fallback extracts PDF links from the returned HTML or follows a direct PDF response.
+It does not execute JavaScript or solve browser verification; HTTP 403, missing
+PDF links, and download/parse failures are reported to the assistant. After fallback
+fails, ask for upload or explicit PRIDE-only continuation instead of retrying discovery.
+PDF parsing requires the existing MinerU configuration; XML does not. Only an actual
+`%PDF-` response is accepted. A discovered Sci-Hub link is not marked as open-access
+or assigned a license; discovery is not proof that the PDF is downloadable.
+
+Downloaded PDFs and uploaded PDFs use the same configured MinerU parser and
+session document store. Discovery identifiers are carried into PDF metadata even
+when the model passes only a URL to `parse_pdf_url`. Successful `read_document`
+pages are recorded on the document across turns, including partial-page coverage;
+unread pages remain visible without blocking suggestions supported by already-read passages. `list_documents` exposes identifiers
+and pending `nextReads`. Repeated publication lookup reports matching parsed
+`sessionDocuments` even when Europe PMC has only an abstract. Its
+`fullTextAvailable=false` flag does not invalidate a parsed PDF from another source.
+
+Original downloads are cached in `PUBLICATION_CACHE_DIR` (default `data/publications`)
+for `PUBLICATION_CACHE_TTL_SECONDS` (default seven days), with a size limit of
+`PUBLICATION_CACHE_MAX_MB` (default 256). Cleanup runs on cache access. Mount this path
+on persistent storage to reuse downloads across container restarts. Parsed documents
+remain session-scoped and expire with the existing session TTL. A failed PDF parse
+retains the original download for retry. Tool results distinguish `download_failed`,
+`parse_failed`, and `ready`; discovery distinguishes `abstract_only`, `unavailable`,
+`identifier_conflict`, and `needs_confirmation`. Transient HTTP errors retry up to
+three attempts; abstracts are not treated as full-text evidence.
+
+### Independent abstract and supplementary evidence
+
+`find_publication` stores the available Europe PMC abstract as a separate session
+document, labelled `evidenceKind=abstract`, without truncating it to 4,000 characters.
+`get_publication_abstract(pmid)` provides a PubMed EFetch fallback. Neither source
+requires article XML, and reading an abstract never satisfies the setup evidence gate.
+
+`find_publication_supplements(pmid, doi)` independently inspects the publisher DOI
+landing page, the PMC article page when a PMCID is present, and NCBI's supplementary
+BioC listing. Each source reports its own outcome; no result is not proof that no
+supplements exist. JavaScript-only pages, anti-bot challenges and HTTP 403 may still
+prevent discovery or download. Pass accession to also check PRIDE project files. Third-party supplement mirrors are not searched automatically.
+
+`get_publication_supplement(url, member?)` downloads only a link discovered in the
+same session, or an explicit user-provided HTTP(S) link with userProvided=true (fileName supplies the extension for opaque download URLs). ZIP downloads list members before parsing a selected member. PDF uses
+the configured MinerU parser; XLSX/XLS preserve worksheet names and row numbers;
+CSV/TSV/TXT and DOCX are converted into readable sections. NCBI BioC yields converted
+text rather than the original spreadsheet layout. Originals use the publication
+cache; downloads keep normal proxy settings (the Sci-Hub exception is unchanged).
+Archives are read in memory, never extracted to filesystem paths, and limited to
+300 entries / 100 MB expanded. Parsed text is limited to 2 million characters.
+Unsupported, inaccessible and unparseable attachments return distinct outcomes.
+
+Supplement documents carry their parent DOI/PMID, source URL, archive member and
+`evidenceKind=supplement`. AI uses `read_document` with pagination and references
+file, sheet/section and row. A matching supplement with a successfully read passage satisfies the document
+availability check even without article XML, but is not labelled a full article.
+Prompts still require evidence for each proposed field and current-PXD sample counts;
+the gate does not establish that an arbitrary table supports a particular claim.
+The upload UI and /api/uploads/document accept PDF, XLSX, XLS, CSV, TSV, TXT, DOCX and ZIP. ZIP uploads parse up to 20 supported members within the existing archive/text bounds, preserving member names; unsupported members are listed, and any supported member parse failure fails the upload explicitly. PRIDE files and user links retain their actual provenance without inferred paper identifiers.
+
+### Content-based setup checks
+
+Setup checks no longer whitelist or blacklist section headings or require the entire
+paper to be read. They check that an identified, matching non-abstract document has
+actually returned a nonempty passage. `readingStatus` reports exact ranges and
+`nextReads` lists remaining content, including gaps; neither is a universal checklist.
+The model must assess evidence per field and cite relevant passages. Supported
+template cards can be proposed while sample count remains unresolved. Passing this
+check does not verify scientific claims or imply whole-document coverage. Abstract
+classification is based on source metadata, not a section's name.
+
+## Dynamic SDRF template catalogue
+
+The wizard now requires this backend for template discovery and rule resolution, even when the AI assistant is disabled. Install the current `requirements.txt` (including `jsonschema` and `semantic-version`) and restart the backend alongside the rebuilt frontend. No LLM key is required for `/api/template-catalog/*`.
+
+Each entry to template selection checks `bigbio/sdrf-templates/main`; downloads use one pinned commit. Complete snapshots persist under `data/template_catalog/` (mount this directory if persistence is desired). A failed update returns the previous complete snapshot with `stale: true`; first-load failure returns 503. Optionally set `TEMPLATE_GITHUB_TOKEN` for REST rate limits. Public Git ref discovery is also supported.
+
+See [dynamic template rules](../docs/template-selection-rules.md) for the API, migration behavior and the distinction between snapshot preflight and full ontology/SDRF validation.

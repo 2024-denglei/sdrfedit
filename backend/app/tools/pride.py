@@ -1,9 +1,9 @@
-"""PRIDE Archive lookups: project metadata plus raw/acquisition file names.
+"""PRIDE Archive lookups for project metadata and raw/acquisition files.
 
-The frontend already fetches raw file names directly
-(src/app/core/services/pride-archive.service.ts); this module additionally
-returns the project-level metadata and publication references the assistant
-needs to draft an annotation.
+The two concerns deliberately have separate functions so the assistant can
+inspect project-level metadata without also downloading and returning a large
+file listing. The frontend also fetches raw file names directly in
+``src/app/core/services/pride-archive.service.ts``.
 """
 
 from __future__ import annotations
@@ -17,9 +17,9 @@ PRIDE_API_BASE = "https://www.ebi.ac.uk/pride/ws/archive/v3"
 PROJECT_URL = "https://www.ebi.ac.uk/pride/archive/projects/{accession}"
 
 RAW_EXTENSIONS = (
-    ".raw", ".wiff", ".wiff.scan", ".d", ".d.zip", ".mzml", ".mzxml", ".mzml.gz",
-    ".baf", ".tdf", ".tdf_bin", ".lcd", ".qgd", ".dat", ".pkl", ".ibd",
+    ".raw", ".wiff", ".wiff2", ".d", ".baf", ".lcd", ".qgd",
 )
+RAW_COMPRESSION_SUFFIXES = (".tar.gz", ".tar", ".zip", ".gz")
 ACCESSION_RE = re.compile(r"\b(PXD|PRD|MSV|IPX)\d{4,}\b", re.IGNORECASE)
 
 
@@ -54,7 +54,7 @@ def _strip_html(text: str | None) -> str:
 
 
 async def fetch_project(accession: str) -> dict:
-    """Project-level metadata, trimmed to what matters for SDRF annotation."""
+    """Project metadata for SDRF annotation, without text or attribute truncation."""
     accession = normalize_accession(accession)
     payload = await get_json(f"{PRIDE_API_BASE}/projects/{accession}")
 
@@ -82,9 +82,9 @@ async def fetch_project(accession: str) -> dict:
     return {
         "accession": accession,
         "title": payload.get("title", ""),
-        "description": _strip_html(payload.get("projectDescription"))[:2500],
-        "sampleProcessingProtocol": _strip_html(payload.get("sampleProcessingProtocol"))[:2500],
-        "dataProcessingProtocol": _strip_html(payload.get("dataProcessingProtocol"))[:2500],
+        "description": _strip_html(payload.get("projectDescription")),
+        "sampleProcessingProtocol": _strip_html(payload.get("sampleProcessingProtocol")),
+        "dataProcessingProtocol": _strip_html(payload.get("dataProcessingProtocol")),
         "organisms": _cv_names(payload.get("organisms")),
         "organismParts": _cv_names(payload.get("organismParts")),
         "diseases": _cv_names(payload.get("diseases")),
@@ -98,25 +98,35 @@ async def fetch_project(accession: str) -> dict:
         "publicationDate": payload.get("publicationDate"),
         "submissionType": payload.get("submissionType"),
         "references": references,
-        "sampleAttributes": sample_attributes[:40],
+        "sampleAttributes": sample_attributes,
         "url": PROJECT_URL.format(accession=accession),
     }
 
 
 def _is_raw(name: str, category: str | None) -> bool:
-    if (category or "").upper() == "RAW":
-        return True
+    # An explicit repository classification takes precedence over the filename.
+    # In particular, Mascot .dat files are SEARCH outputs, not acquisitions.
+    normalized_category = (category or "").strip().upper()
+    if normalized_category:
+        return normalized_category == "RAW"
+    # With no classification, only infer unambiguous instrument formats.
+    # Open formats can also be processed peak lists; sidecars are not runs.
     lowered = name.lower()
+    for suffix in RAW_COMPRESSION_SUFFIXES:
+        if lowered.endswith(suffix):
+            lowered = lowered[:-len(suffix)]
+            break
     return any(lowered.endswith(ext) for ext in RAW_EXTENSIONS)
 
 
-async def fetch_raw_files(accession: str, limit: int = 400) -> dict:
+async def fetch_raw_files(accession: str) -> dict:
     """Raw / acquisition file names for a project."""
     accession = normalize_accession(accession)
     payload = await get_json(f"{PRIDE_API_BASE}/projects/{accession}/files/all", timeout=60.0)
 
     entries = payload if isinstance(payload, list) else payload.get("_embedded", {}).get("files", payload.get("files", []))
     raw_names: list[str] = []
+    file_urls: dict[str, str] = {}
     all_count = 0
 
     for entry in entries or []:
@@ -126,22 +136,18 @@ async def fetch_raw_files(accession: str, limit: int = 400) -> dict:
         name = entry.get("fileName") or entry.get("name") or ""
         if name and _is_raw(name, entry.get("fileCategory", {}).get("value") if isinstance(entry.get("fileCategory"), dict) else entry.get("fileCategory")):
             raw_names.append(name)
+            for location in entry.get("publicFileLocations") or []:
+                url = location.get("value", "") if isinstance(location, dict) else location
+                if isinstance(url, str) and url.startswith(("ftp://", "https://", "http://")):
+                    file_urls.setdefault(name, url)
+                    break
 
     raw_names = sorted(dict.fromkeys(raw_names))
     return {
         "accession": accession,
         "rawFileCount": len(raw_names),
         "totalFileCount": all_count,
-        "rawFileNames": raw_names[:limit],
-        "truncated": len(raw_names) > limit,
+        "rawFileNames": raw_names,
+        "fileUrls": {name: file_urls[name] for name in raw_names if name in file_urls},
+        "truncated": False,
     }
-
-
-async def fetch_dataset_overview(accession: str) -> dict:
-    """Project metadata plus raw files in one call (the usual first agent step)."""
-    project = await fetch_project(accession)
-    try:
-        files = await fetch_raw_files(accession)
-    except ToolHttpError as error:
-        files = {"accession": project["accession"], "rawFileCount": 0, "rawFileNames": [], "error": str(error)}
-    return {**project, "files": files}

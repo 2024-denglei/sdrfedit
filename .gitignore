@@ -248,3 +248,9 @@ backend/k8s/*.local.md
 PXD*.pdf
 sdrf-agent-trace-*.json
 *.canvas.tsx
+
+# Downloaded public article cache
+backend/data/publications/
+
+# Complete, commit-pinned official template snapshots
+backend/data/template_catalog/

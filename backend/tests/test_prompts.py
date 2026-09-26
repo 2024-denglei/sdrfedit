@@ -1,4 +1,4 @@
-"""Step-focus prompts must match the new 6-step wizard semantics."""
+"""Step-focus prompts must match the current five-step wizard semantics."""
 
 from app.llm.prompts import (
     CHARACTERISTICS_PROCEDURE,
@@ -13,6 +13,22 @@ from app.llm.prompts import (
     render_wizard_context,
 )
 from app.schemas import CharacteristicColumnInfo, FactorInfo, MsRunSummary, WizardSnapshot
+from app.schemas import OPS_BY_STEP
+
+
+def test_every_step_advertises_its_entire_operation_whitelist():
+    for step, operations in OPS_BY_STEP.items():
+        text = render_step_focus(step, None)
+        catalogue = text.split("Operation arguments and usage:")[0]
+        for operation in operations:
+            assert operation in catalogue
+
+
+def test_runs_files_explains_import_arguments_and_dependency():
+    text = render_step_focus("runs-files", WizardSnapshot())
+    assert 'replaceWithUnassignedFileNames [["exact1.raw", "exact2.raw"]]' in text
+    assert "import card BEFORE the plan card" in text
+    assert "existing unassigned names" in text
 
 
 def test_wizard_steps_doc_matches_new_ui():
@@ -32,13 +48,15 @@ def test_setup_goal_is_template_first():
     assert "rawfilecount" in goal.replace(" ", "").replace("_", "")
 
 
-def test_sample_count_rules_define_sum_of_bio_reps():
+def test_sample_count_rules_define_accession_scoped_sources():
     text = SAMPLE_COUNT_RULES.lower()
     assert "biological" in text
     assert "condition" in text
     assert "raw file" in text or "rawfilecount" in text.replace(" ", "").replace("_", "")
     assert "design:" in SAMPLE_COUNT_RULES
-    assert "rejected:" in SAMPLE_COUNT_RULES
+    assert "scope:" in SAMPLE_COUNT_RULES
+    assert "files:" in SAMPLE_COUNT_RULES
+    assert "uncertainty:" in SAMPLE_COUNT_RULES
     assert SAMPLE_COUNT_RULES in SETUP_PROCEDURE
 
 
@@ -67,7 +85,7 @@ def test_samples_goal_follows_wizard_order():
 
 def test_runs_files_goal_requires_named_mapping():
     goal = STEP_GOALS["runs-files"].lower()
-    assert "assignfilestorunsbyname" in goal.replace(" ", "").replace("_", "")
+    assert "applyrunsfilesplan" in goal.replace(" ", "").replace("_", "")
     assert "fraction" in goal or "technical" in goal
 
 
@@ -93,7 +111,7 @@ def test_render_step_focus_runs_files_includes_procedure():
     assert RUNS_FILES_PROCEDURE.splitlines()[0] in text
     assert "assignFilesToRunsByName" in text
     assert "Editable table" in text or "fractionId" in text
-    assert "no MS runs yet" in text
+    assert "No groups yet" in text
 
 
 def test_render_step_focus_samples_includes_procedure():
@@ -167,15 +185,15 @@ def test_render_step_focus_setup_includes_procedure():
     assert "STOP" in text
 
 
-def test_setup_procedure_pdf_gate_prefers_mineru_session_document():
+def test_setup_procedure_prefers_xml_session_document_before_pdf():
     text = SETUP_PROCEDURE.lower()
     assert "list_documents" in SETUP_PROCEDURE
     assert "parse_pdf_url" in SETUP_PROCEDURE
-    assert "check_pdf_url" in SETUP_PROCEDURE
+    assert SETUP_PROCEDURE.index("get_publication_full_text") < SETUP_PROCEDURE.index("parse_pdf_url")
     assert "parse_pdf_url" in text
     assert "get_publication_full_text" in SETUP_PROCEDURE
     assert "session document" in text
-    assert "paperclip" in text
+    assert "upload" in text
     assert "proposing templates" in text or "propose templates" in text
     # Gate must appear before template listing
     assert SETUP_PROCEDURE.index("list_documents") < SETUP_PROCEDURE.index("list_sdrf_templates")
@@ -191,8 +209,10 @@ def test_setup_procedure_no_publication_offers_pride_fallback():
 def test_characteristics_procedure_reuses_evidence_and_limits_lookups():
     text = CHARACTERISTICS_PROCEDURE.lower()
     assert "evidence already gathered" in text
-    assert "do not call get_pride_dataset" in text
-    assert "at most one lookup per column" in text
+    assert "call get_pride_metadata only if" in text
+    assert "full result is absent" in text
+    assert "each distinct controlled value" in text
+    assert "avoid duplicate lookups" in text
     assert "search_ontology" in text
     assert "recommended" in text
     assert "search_specification" in text
@@ -253,3 +273,84 @@ def test_render_wizard_context_accepts_legacy_string_columns():
     snapshot = WizardSnapshot(characteristicColumns=["characteristics[organism]"])
     text = render_wizard_context(snapshot)
     assert "characteristics[organism]" in text
+
+
+def test_rendered_setup_scopes_counts_and_reconciles_file_coverage():
+    text = render_step_focus("setup", WizardSnapshot(sampleCount=98))
+    for rule in (
+        "CURRENT accession",
+        "multiple accessions",
+        "MGF-only records may exist",
+        "Matching filename stems are candidate links",
+        "Equality is valid",
+        "omit setSampleCount, preserve the current value",
+        "Record blanks/QC/reference pools separately",
+        "ONLY when groups contain disjoint",
+    ):
+        assert rule in text
+    for obsolete in (
+        "NEVER rawFileCount",
+        "never set sampleCount = rawFileCount",
+        "explicitly reject conditionCount / rawFileCount",
+        "universal definition",
+    ):
+        assert obsolete not in text
+
+
+def test_setup_distinguishes_pure_cultures_from_communities():
+    assert "Pure cultures of fungi" in SETUP_PROCEDURE
+    assert "bacteria" in SETUP_PROCEDURE
+    assert "sample=null" in SETUP_PROCEDURE
+    assert "argsJson='[null]'" in SETUP_PROCEDURE
+    assert "pure isolate originating from soil/water is not a microbial community" in SETUP_PROCEDURE
+    for template in ("metaproteomics", "human-gut", "soil", "water"):
+        assert template in SETUP_PROCEDURE
+
+
+def test_merged_sample_prompt_includes_definitions_and_assignments():
+    text = render_step_focus("samples", WizardSnapshot(currentStep=1, currentStepId="samples"))
+    assert 'step 2 of 5' in text
+    assert 'Samples & Groups' in text
+    for op in ('addCharacteristicChoice', 'setFactors', 'setSourceNames', 'setSampleCharacteristicValue', 'setFactorColumnValues'):
+        assert op in text
+    assert CHARACTERISTICS_PROCEDURE in text
+    assert 'Do not assign values to individual samples yet' not in text
+
+
+def test_samples_have_one_integrated_procedure_and_preserve_manual_work():
+    text = render_step_focus("samples", WizardSnapshot(sampleCount=2))
+    questions = [
+        "1. What are your sample names and biological replicates?",
+        "2. What describes your samples?",
+        "3. Which attributes are your study factors?",
+        "4. Review sample metadata.",
+    ]
+    assert [text.index(q) for q in questions] == sorted(text.index(q) for q in questions)
+    assert text.count(CHARACTERISTICS_PROCEDURE) == 1
+    assert "balanced group sizes alone" in text
+    assert "existing or newly proposed candidates" in text
+    assert "Preserve an existing explicit no-factor decision" in text
+    assert render_step_focus("characteristics", None) == render_step_focus("samples", None)
+
+
+def test_protocol_context_exposes_template_fields_and_avoids_unconditional_ms_requirements():
+    snapshot = WizardSnapshot(
+        protocolColumns=[{"name": "comment[assay]", "requirement": "required"}],
+        genericProtocolFields=[{"name": "comment[assay]", "value": "Olink", "options": ["Olink"]}],
+        selectedTemplates=[{"name": "affinity-proteomics", "version": "1.0.0"}],
+    )
+    focus = render_step_focus("protocol", snapshot)
+    assert "setTemplateValue" in focus
+    assert "must not be forced through MS-only fields" in focus
+    context = render_wizard_context(snapshot)
+    assert "comment[assay]" in context and "Olink" in context
+    assert "authoritative, pinned versions" in context
+
+
+def test_sample_recommendations_use_explicit_attribute_editor_not_implicit_defaults():
+    text = render_step_focus("samples", WizardSnapshot(sampleCount=3))
+    assert 'applyCharacteristicDraft [column, choices, "explicit", assignments]' in text
+    assert 'A candidate alone NEVER assigns all samples' in text
+    assert 'single candidate applies to all samples automatically' not in text
+    assert 'Unknown membership stays ""' in text
+    assert 'one card per attribute' in text

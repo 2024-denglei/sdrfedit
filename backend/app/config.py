@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     mineru_timeout_seconds: float = 300.0
     mineru_poll_interval_seconds: float = 5.0
 
+    template_github_token: str = ""
+
     spec_url: str = "https://sdrf.quantms.org/specification.html"
     spec_index_dir: str = "data/spec_index"
     spec_source_file: str = "data/spec/specification.md"
@@ -56,6 +58,12 @@ class Settings(BaseSettings):
     cellline_db_file: str = "../sdrf-proteomics/cl-annotations-db.tsv"
     cellline_synonyms_file: str = "../sdrf-proteomics/ai-synonyms.tsv"
     cellline_index_dir: str = "data/cellline_index"
+
+    scihub_base_url: str = "https://www.sci-hub.ee/"
+    scihub_trust_env: bool = False
+    publication_cache_dir: str = "data/publications"
+    publication_cache_ttl_seconds: int = 604800
+    publication_cache_max_mb: int = 256
 
     max_upload_mb: int = 30
     session_ttl_seconds: int = 7200

@@ -13,8 +13,7 @@ const PRIDE_API_BASE = 'https://www.ebi.ac.uk/pride/ws/archive/v3';
 
 const RAW_CATEGORY = 'RAW';
 /** Instrument raw dumps commonly deposited as RAW in PRIDE. */
-const RAW_NAME_RE = /\.(raw|wiff|wiff\.scan)(\.gz)?$/i;
-const RAW_DIR_RE = /\.d(\.zip|\.tar(\.gz)?)?$/i;
+const RAW_NAME_RE = /\.(raw|wiff|wiff2|d|baf|lcd|qgd)(\.tar\.gz|\.tar|\.zip|\.gz)?$/i;
 
 export function normalizePxdAccession(input: string): string {
   const trimmed = (input || '').trim().toUpperCase();
@@ -32,6 +31,7 @@ export function isValidPxdAccession(accession: string): boolean {
 
 function categoryValue(file: Record<string, unknown>): string {
   const cat = file['fileCategory'];
+  if (typeof cat === 'string') return cat;
   if (cat && typeof cat === 'object' && cat !== null && 'value' in cat) {
     return String((cat as { value?: string }).value || '');
   }
@@ -39,8 +39,10 @@ function categoryValue(file: Record<string, unknown>): string {
 }
 
 function isLikelyRawFile(fileName: string, category: string): boolean {
-  if (category.toUpperCase() === RAW_CATEGORY) return true;
-  return RAW_NAME_RE.test(fileName) || RAW_DIR_RE.test(fileName);
+  const normalizedCategory = category.trim().toUpperCase();
+  if (normalizedCategory) return normalizedCategory === RAW_CATEGORY;
+  // Match the backend: infer instrument formats only when classification is absent.
+  return RAW_NAME_RE.test(fileName);
 }
 
 /**
@@ -49,7 +51,7 @@ function isLikelyRawFile(fileName: string, category: string): boolean {
 export async function fetchPrideRawFileNames(
   pxdInput: string,
   options?: { timeoutMs?: number; signal?: AbortSignal }
-): Promise<{ accession: string; fileNames: string[] }> {
+): Promise<{ accession: string; fileNames: string[]; fileUrls: Record<string, string> }> {
   const accession = normalizePxdAccession(pxdInput);
   if (!isValidPxdAccession(accession)) {
     throw new Error('Invalid PXD accession. Expected format: PXD000001');
@@ -78,6 +80,7 @@ export async function fetchPrideRawFileNames(
     const payload = (await response.json()) as unknown;
     const list = Array.isArray(payload) ? payload : [];
     const names = new Set<string>();
+    const fileUrls: Record<string, string> = Object.create(null);
 
     for (const item of list) {
       if (!item || typeof item !== 'object') continue;
@@ -87,6 +90,13 @@ export async function fetchPrideRawFileNames(
       const category = categoryValue(rec);
       if (!isLikelyRawFile(fileName, category)) continue;
       names.add(fileName);
+      for (const location of (Array.isArray(rec['publicFileLocations']) ? rec['publicFileLocations'] : [])) {
+        const url = typeof location === 'string' ? location : location?.value;
+        if (typeof url === 'string' && /^(https?|ftp):\/\//i.test(url)) {
+          fileUrls[fileName] ??= url;
+          break;
+        }
+      }
     }
 
     const fileNames = [...names].sort((a, b) =>
@@ -97,7 +107,7 @@ export async function fetchPrideRawFileNames(
       throw new Error(`No RAW files found for ${accession}`);
     }
 
-    return { accession, fileNames };
+    return { accession, fileNames, fileUrls };
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') {
       throw new Error(`Timed out fetching files for ${accession}`);

@@ -1,4 +1,4 @@
-import { WizardState } from './wizard';
+import { ProtocolField, WizardState } from './wizard';
 
 /**
  * Wizard AI assistant contracts.
@@ -46,6 +46,26 @@ export interface WizardActionCard {
   status: 'pending' | 'applied' | 'dismissed' | 'failed';
   preview: string;
   error?: string;
+  /** Present only on cards owned by an explicit automatic annotation run. */
+  automationRunId?: string;
+  autoApplied?: boolean;
+  executionState?: 'rolled-back' | 'not-executed' | 'superseded' | 'repair-rejected';
+  replacesCardId?: string;
+  replacedByCardId?: string;
+  repairHistory?: Array<{
+    attempt: number;
+    status: 'requested' | 'accepted' | 'rejected';
+    message: string;
+    replacementIds: string[];
+  }>;
+}
+
+export interface AutomationReport {
+  status: 'ready' | 'blocked';
+  /** Blocking problems for the current step only. */
+  issues: string[];
+  /** Informational explanations never trigger retries. Optional for older servers. */
+  notes?: string[];
 }
 
 /** One tool call in the timeline — may still be running. */
@@ -76,6 +96,7 @@ export interface AssistantNextStep {
  * tool/text block in the tracked list (that was hiding results in the UI).
  */
 export type AssistantTimelineItem =
+  | { kind: 'thinking'; id: string; content: string; reasoning?: string; startedAt: number; finishedAt?: number }
   | { kind: 'tool'; id: string; call: AssistantToolCall }
   | { kind: 'text'; id: string; content: string };
 
@@ -103,6 +124,8 @@ export interface AssistantChatMessage {
   content: string;
   /** True when the panel asked on the user's behalf after a step change. */
   auto?: boolean;
+  /** Short label for an automatic turn; content remains the full model context. */
+  autoLabel?: string;
   /** Uploaded file card (UI); `content` still holds the prompt sent to the model. */
   attachment?: AssistantAttachment;
   /** Slash skill chip (UI), e.g. /sdrf-annotate PXD000547. */
@@ -111,7 +134,7 @@ export interface AssistantChatMessage {
   focusStep?: AssistantStepId;
   /** Live progress line for the tool currently running. */
   status?: string;
-  /** Streamed blocks in arrival order (tools and text). */
+  /** Streamed blocks in arrival order (thinking, tools and text). */
   timeline?: AssistantTimelineItem[];
   /** Mirror of tool blocks; kept for older localStorage sessions. */
   toolCalls?: AssistantToolCall[];
@@ -122,6 +145,8 @@ export interface AssistantChatMessage {
   error?: string;
   /** Backend debug info from the turn's `done.trace` (propose rejects, etc.). */
   trace?: Record<string, unknown> | null;
+  /** Preserve the completion decision separately from the conversational text. */
+  automation?: AutomationReport | null;
 }
 
 /** One persisted chat the user can reopen without logging in. */
@@ -159,22 +184,37 @@ export interface WizardSnapshot {
   currentStep: number;
   currentStepId: AssistantStepId | null;
   sampleTemplate: string | null;
+  sampleMetadataTemplates?: string[];
+  templateSnapshotId?: string;
+  selectedTemplates?: Array<{ name: string; version: string }>;
   technologyTemplate: string | null;
   experimentTemplates: string[];
   sampleCount: number;
   experimentDescription: string;
   characteristicColumns: CharacteristicColumnSnapshot[];
   characteristicChoices: Record<string, string[]>;
-  /** Current source names in wizard order (Step 3). */
+  protocolFields?: Record<string, ProtocolField>;
+  protocolIssues?: string[];
+  protocolColumns?: { name: string; requirement: string }[];
+  genericProtocolFields?: { name: string; requirement: string; description: string; value: string; options: string[]; type?: string; validators: unknown[]; allowNotAvailable?: boolean; allowNotApplicable?: boolean }[];
+  /** Current source names in wizard order (Step 2). */
   sampleSourceNames?: string[];
-  /** Current biological replicate numbers in wizard order (Step 3). */
+  /** Detailed assignments are sent on every assistant turn to preserve existing edits. */
+  sampleAssignments?: {
+    index: number;
+    sourceName: string;
+    biologicalReplicate: number;
+    characteristicValues: Record<string, string>;
+    factorValues: Record<string, string>;
+  }[];
+  /** Current biological replicate numbers in wizard order (Step 2). */
   biologicalReplicates?: number[];
-  /** Columns with 2+ Step-2 candidates that need per-sample values on Step 3. */
+  /** Columns with 2+ Step-2 candidates that need per-sample values on Step 2. */
   multiValueCharacteristicColumns?: string[];
   labelConfigId: string | null;
   msRunCount: number;
   /** Run name + bound sample source names (for file↔run matching). */
-  msRunSummaries?: { name: string; sampleSourceNames: string[] }[];
+  msRunSummaries?: { name: string; sampleSourceNames: string[]; sampleMappingMode?: 'separate' | 'pooled' | 'rows'; factorValues?: Record<string, string>; labelConfigId?: string; channels?: {label: string; sourceName?: string; role: string; mappingId?: string; pooledSourceNames?: string[]; sourceNameOverride?: string}[]; files?: {fileName: string; mappingId?: string; sourceName?: string; fractionId: number; technicalReplicate: number}[] }[];
   dataFileCount: number;
   /** All current raw file names in wizard order. */
   dataFileNames?: string[];
@@ -187,11 +227,15 @@ export interface WizardSnapshot {
   instrument: string | null;
   cleavageAgent: string | null;
   modifications: string[];
+  precursorMassTolerance: string;
+  fragmentMassTolerance: string;
   /** Enabled factor names (short view). */
   factors: string[];
   /** Factor definitions with Step-2 candidate values. */
-  factorDefinitions?: { name: string; values: string[] }[];
-  /** Factors with 2+ candidates needing per-sample picks on Step 3. */
+  factorDefinitions?: { name: string; values: string[]; sourceCharacteristic?: string; reasoning?: string; scope?: 'sample' | 'run' }[];
+  factorDecision?: 'pending' | 'none';
+  noFactorReason?: string;
+  /** Factors with 2+ candidates needing per-sample picks on Step 2. */
   multiValueFactorColumns?: string[];
   acquisitionMethod: string | null;
 }
@@ -205,6 +249,7 @@ export interface AssistantChatRequest {
   focusStep?: AssistantStepId;
   /** `step` when the panel asked on the user's behalf after a step change. */
   mode?: 'chat' | 'step';
+  executionMode?: 'manual' | 'auto';
   /** Named skill resolved from a slash command. */
   skill?: string | null;
   skillArgs?: string | null;
@@ -212,6 +257,7 @@ export interface AssistantChatRequest {
 
 /** Events streamed from `POST /api/chat`. */
 export type AssistantStreamEvent =
+  | { type: 'thinking'; text: string }
   | { type: 'status'; text: string }
   | { type: 'token'; text: string }
   | { type: 'tool_start'; tool: AssistantToolCall }
@@ -228,6 +274,7 @@ export type AssistantStreamEvent =
         citations: AssistantCitation[];
         toolCalls: AssistantToolCall[];
         nextStep: AssistantNextStep | null;
+        automation?: AutomationReport | null;
         trace?: Record<string, unknown> | null;
       };
     };

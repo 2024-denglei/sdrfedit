@@ -8,40 +8,258 @@ JSON-serialisable result that is fed back to the model.
 from __future__ import annotations
 
 import json
+import hashlib
+import io
+import zipfile
+from urllib.parse import quote, urlsplit, unquote
+from pathlib import PurePosixPath
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from ..parsing.base import PdfParseError
+from ..config import get_settings
+from ..parsing.base import ParsedDocument, PdfParseError
 from ..parsing.factory import get_pdf_parser
 from ..session import get_session_store
-from . import celllines, literature, ontology, pride, spec_search, templates
-from .http import ToolHttpError, get_bytes
+from . import celllines, literature, ontology, pride, pride_technical, spec_search, templates, supplements
+from .http import ToolHttpError, get_bytes, get_text
+from .publication_cache import cached_download, SupplementDownloadError
 
 Handler = Callable[[dict[str, Any], str], Awaitable[Any]]
 
 MAX_RESULT_CHARS = 24000
+MAX_DOCUMENT_CHARS = 12000
 MAX_SUMMARY_CHARS = 240
 
 
 # --------------------------------------------------------------------- handlers
 
 
-async def _get_dataset(args: dict, _session: str) -> Any:
-    return await pride.fetch_dataset_overview(args["accession"])
+async def _get_metadata(args: dict, _session: str) -> Any:
+    accession = pride.normalize_accession(args["accession"])
+    return await get_session_store().fetch_pride_metadata(_session, accession, pride.fetch_project)
 
 
 async def _get_raw_files(args: dict, _session: str) -> Any:
-    return await pride.fetch_raw_files(args["accession"], int(args.get("limit", 400)))
+    accession = pride.normalize_accession(args["accession"])
+    return await get_session_store().fetch_pride_raw_files(_session, accession, pride.fetch_raw_files)
 
 
 async def _find_publication(args: dict, _session: str) -> Any:
-    return await literature.lookup_publication(
-        pmid=args.get("pmid"), doi=args.get("doi"), title=args.get("title")
+    result = await literature.lookup_publication(
+        pmid=args.get("pmid"), doi=args.get("doi"), title=args.get("title"),
+        use_fallback=args.get("useFallback", False)
     )
+    for candidate in result.get("pdfCandidates", []):
+        get_session_store().remember_pdf_source(_session, candidate["url"], candidate.get("source", "publication"),
+            {key: result[key] for key in ("doi", "pmid", "pmcid", "title") if result.get(key)})
+    abstract = (_store_abstract(result, _session) if result.get("status") not in {"identifier_conflict", "needs_confirmation"}
+                else {"status": "needs_confirmation"})
+    # Discovery returns identifiers and acquisition routes, not article content
+    # or the upstream search response. Keep license/version for PDF acquisition.
+    fields = ("found", "status", "pmid", "pmcid", "doi", "title", "url", "fullTextAvailable", "fallbackAvailable", "fallbackAttempted")
+    compact = {key: result[key] for key in fields if result.get(key) is not None and result.get(key) != ""}
+    compact["abstract"] = abstract
+    compact["supplements"] = {"status": "not_checked", "nextStep": "Call find_publication_supplements independently of XML availability."}
+    if result.get("pdfCandidates"):
+        compact["pdfCandidates"] = result["pdfCandidates"]
+    elif result.get("pdfUrls"):
+        compact["pdfCandidates"] = [{"url": url} for url in result["pdfUrls"]]
+    if result.get("candidates"):
+        compact["candidates"] = [
+            {key: value for key, value in {
+                "pmid": candidate.get("pmid") or (candidate.get("id") if candidate.get("source") == "MED" else None),
+                "pmcid": candidate.get("pmcid"), "doi": candidate.get("doi"),
+                "title": candidate.get("title"), "year": candidate.get("pubYear"),
+            }.items() if value}
+            for candidate in result["candidates"]
+        ]
+    if result.get("warnings"):
+        compact["warnings"] = result["warnings"]
+    if result.get("nextStep"):
+        compact["nextStep"] = result["nextStep"].replace("pdfUrls", "pdfCandidates")
+    if result.get("found") and result.get("status") not in {"identifier_conflict", "needs_confirmation"}:
+        matching = []
+        for doc in get_session_store().list_for_session(_session):
+            if doc.metadata.get("evidenceKind") == "abstract":
+                continue
+            identifiers = {**doc.metadata, **(doc.metadata.get("identifiers") or {})}
+            pairs = [(key, result[key], identifiers[key]) for key in ("doi", "pmid", "pmcid")
+                     if result.get(key) and identifiers.get(key)]
+            def normalized(key, value):
+                return literature.normalize_doi(str(value)) if key == "doi" else str(value).strip().lower()
+            if pairs and all(normalized(key, left) == normalized(key, right) for key, left, right in pairs):
+                matching.append(doc.document_id)
+        if matching:
+            compact["sessionDocuments"] = [doc for doc in (await _list_documents({}, _session))["documents"]
+                                           if doc["documentId"] in matching]
+            compact["nextStep"] = ("Matching paper evidence is already parsed as a session document. "
+                                   "Use read_document with its documentId; follow nextReads for unread sections. "
+                                   "nextReads lists unread content, not mandatory blockers. Read passages needed for each proposed field. "
+                                   "fullTextAvailable describes Europe PMC XML only. Check evidenceKind: supplements and abstracts are not the full article. "
+                                   "Do not download again or request upload.")
+    compact["nextStep"] = compact.get("nextStep", "") + " Independently call find_publication_supplements for associated data, especially sample-design tables; XML failure does not mean supplements are unavailable."
+    return compact
 
 
-async def _get_full_text(args: dict, _session: str) -> Any:
-    return await literature.fetch_full_text(args["pmcid"], args.get("sections"))
+def _document_result(stored, cached=False) -> dict:
+    return {"ok": True, "status": "ready", "documentId": stored.document_id,
+            "cached": cached, "parser": stored.document.parser,
+            "evidenceKind": stored.metadata.get("evidenceKind", "article"),
+            "readingStatus": stored.reading_status(),
+            "fileName": stored.file_name, "url": stored.origin,
+            "pmcid": stored.metadata.get("pmcid"), "title": stored.metadata.get("title"),
+            "createdAt": stored.created_at,
+            "charCount": stored.document.char_count,
+            "availableSections": list(stored.document.sections) or ["body"], "metadata": stored.metadata,
+            "nextReads": [{"documentId": stored.document_id, "sections": [name], "offset": offset}
+                          for name, offset in stored.unread_sections().items()],
+            "nextStep": "Call read_document with this documentId. Follow nextReads using the exact returned section names, including body/main text when present."}
+
+
+def _store_abstract(publication: dict, session_id: str) -> dict:
+    text = publication.get('abstract') or ''
+    if not text.strip():
+        return {'status': 'not_available', 'nextStep': 'Try get_publication_abstract with the PMID for a PubMed fallback.'}
+    store = get_session_store()
+    identifiers = {k: publication[k] for k in ('pmid', 'pmcid', 'doi', 'title') if publication.get(k)}
+    origin = publication.get('url') or f'https://pubmed.ncbi.nlm.nih.gov/{publication.get("pmid", "")}/'
+    for doc in store.list_for_session(session_id):
+        if doc.origin == origin and doc.metadata.get('evidenceKind') == 'abstract' and doc.document.markdown == text:
+            return {'status': 'ready', 'documentId': doc.document_id, 'evidenceKind': 'abstract', 'charCount': len(text)}
+    doc = store.add_document(session_id, 'publication-abstract.txt', ParsedDocument(text, {'abstract': text}, parser='publication-metadata'),
+                             origin=origin, metadata={**identifiers, 'evidenceKind': 'abstract'})
+    return {'status': 'ready', 'documentId': doc.document_id, 'evidenceKind': 'abstract', 'charCount': len(text),
+            'nextStep': 'Read the abstract with read_document. It is not full-text evidence.'}
+
+
+async def _get_abstract(args: dict, session_id: str) -> dict:
+    from bs4 import BeautifulSoup
+    pmid = str(args['pmid']).strip()
+    if not pmid.isdigit():
+        raise ToolHttpError('PMID must contain digits only.')
+    url = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi'
+    try:
+        xml = await get_text(url, params={'db': 'pubmed', 'id': pmid, 'retmode': 'xml'})
+    except ToolHttpError as error:
+        return {'ok': False, 'status': 'retrieval_failed', 'error': str(error)}
+    soup = BeautifulSoup(xml, 'xml')
+    article = next((a for a in soup.find_all('PubmedArticle') if a.find('PMID') and a.find('PMID').get_text(strip=True) == pmid), None)
+    if article is None:
+        return {'ok': False, 'status': 'not_found', 'error': 'PubMed did not return the requested PMID.'}
+    abstract = '\n\n'.join((p.get('Label', '') + ': ' if p.get('Label') else '') + p.get_text(' ', strip=True)
+                            for p in article.select('Abstract > AbstractText'))
+    title = article.find('ArticleTitle')
+    doi = article.find('ArticleId', {'IdType': 'doi'})
+    return _store_abstract({'pmid': pmid, 'doi': literature.normalize_doi(doi.get_text() if doi else ''),
+                            'title': title.get_text(' ', strip=True) if title else '', 'abstract': abstract,
+                            'url': f'https://pubmed.ncbi.nlm.nih.gov/{pmid}/'}, session_id)
+
+
+async def _find_supplements(args: dict, session_id: str) -> dict:
+    publication = await literature.lookup_publication(pmid=args.get('pmid'), doi=args.get('doi')) if args.get('pmid') or args.get('doi') else {}
+    if publication.get('status') in {'identifier_conflict', 'needs_confirmation'}:
+        return publication
+    identifiers = {key: publication[key] for key in ('doi', 'pmid', 'pmcid', 'title') if publication.get(key)}
+    result = await supplements.discover(publication)
+    if args.get('accession'):
+        try:
+            project = await supplements.discover_pride(args['accession'])
+            result['candidates'].extend(project['candidates'])
+            result['checks'].extend(project['checks'])
+            result['truncated'] = result.get('truncated', False) or project['truncated']
+        except ToolHttpError as error:
+            result['checks'].append({'source': 'pride', 'status': 'discovery_failed', 'error': str(error)})
+        result['status'] = 'found' if result['candidates'] else ('discovery_failed' if any(c['status'] == 'discovery_failed' for c in result['checks']) else 'not_found')
+    store = get_session_store()
+    for candidate in result['candidates']:
+        store.remember_pdf_source(session_id, candidate['url'], 'supplement',
+                                  {**(identifiers if candidate.get('source') != 'pride' else {'accession': candidate['accession']}), 'supplementCandidate': candidate, 'evidenceKind': 'supplement'})
+    return {**identifiers, **result, 'abstract': _store_abstract(publication, session_id),
+            'nextStep': 'Use get_publication_supplement with a returned URL. ZIPs list members first; select the sample-design table. If discovery/download fails, report the source and error, not that no supplements exist.'}
+
+
+async def _get_supplement(args: dict, session_id: str) -> dict:
+    url = args['url']
+    store = get_session_store()
+    identifiers = store.pdf_identifiers(session_id, url)
+    candidate = identifiers.pop('supplementCandidate', None)
+    if not candidate and args.get('userProvided'):
+        parsed_url = urlsplit(url)
+        if parsed_url.scheme not in {'http', 'https'} or not parsed_url.hostname or parsed_url.username or parsed_url.password:
+            return {'ok': False, 'status': 'invalid_url', 'error': 'Provide an HTTP(S) attachment URL without embedded credentials.'}
+        filename = args.get('fileName') or unquote(PurePosixPath(parsed_url.path).name)
+        if PurePosixPath(filename.lower()).suffix not in supplements.SUPPORTED | {'.zip'}:
+            return {'ok': False, 'status': 'unsupported_format', 'error': 'Provide fileName with the actual attachment extension.'}
+        candidate = {'url': url, 'fileName': filename, 'source': 'user-link'}
+        identifiers = {'evidenceKind': 'supplement'}
+        store.remember_pdf_source(session_id, url, 'supplement', {**identifiers, 'supplementCandidate': candidate})
+    if not candidate or identifiers.get('evidenceKind') != 'supplement':
+        return {'ok': False, 'status': 'not_discovered', 'error': 'Call find_publication_supplements first and use a returned URL.'}
+    member = args.get('member')
+    for doc in store.list_for_session(session_id):
+        if doc.origin == url and doc.metadata.get('evidenceKind') == 'supplement' and doc.metadata.get('archiveMember') == member:
+            return _document_result(doc, True)
+    try:
+        data, path = await cached_download(url, 'supplement')
+    except ToolHttpError as error:
+        return {'ok': False, 'status': 'download_failed', 'url': url, 'error': str(error),
+                'reason': error.reason if isinstance(error, SupplementDownloadError) else 'request_failed',
+                'source': candidate.get('source'),
+                'nextStep': 'Do not retry this failed URL in this acquisition attempt. Try other already-discovered relevant attachments, '
+                            'preferring publisher originals, then NCBI converted supplementary text or matching PRIDE project tables. '
+                            'If discovery has not covered these sources, call find_publication_supplements with the known PMID/DOI '
+                            'and current accession. Verify publication/project identity before using an alternative; converted text '
+                            'may lose table formatting. If all relevant alternatives fail, ask the user to download the attachment '
+                            'in a browser, complete any browser verification, and upload it. Report download failure, not absence '
+                            'of supplements. Preserve the abstract and other documents; leave unsupported fields unresolved.'}
+    filename = candidate['fileName']
+    try:
+        if filename.lower().endswith('.zip'):
+            members = supplements.archive_members(data)
+            if not member:
+                return {'ok': True, 'status': 'downloaded', 'url': url, 'members': members,
+                        'nextStep': 'Call get_publication_supplement again with the exact member name, prioritizing Table 1/sample design. Nothing has been parsed yet.'}
+            selected = next((item for item in members if item['fileName'] == member), None)
+            if not selected or not selected['supported']:
+                raise PdfParseError('Select a supported member returned in the ZIP listing.')
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                data = archive.read(member)
+            filename = member
+        elif member:
+            raise PdfParseError('member is only supported for ZIP archives.')
+        document = await supplements.parse_attachment(data, filename, candidate.get('source', ''))
+    except Exception as error:
+        return {'ok': False, 'status': 'parse_failed', 'url': url, 'error': str(error),
+                'nextStep': 'The original attachment is cached. Try another supported member or provide a smaller readable table.'}
+    doc = store.add_document(session_id, filename, document, origin=url,
+                             metadata={**identifiers, 'archiveMember': member, 'rawPath': path,
+                                       'source': candidate.get('source'), 'sha256': hashlib.sha256(data).hexdigest()})
+    result = _document_result(doc)
+    result['nextStep'] = 'Read this supplementary document using nextReads. Cite its filename, sheet/section and row numbers. It only supports fields explicitly documented, not unknown sample counts.'
+    return result
+
+
+async def _get_full_text(args: dict, session_id: str) -> Any:
+    pmcid = args["pmcid"].strip().upper()
+    if pmcid.isdigit():
+        pmcid = "PMC" + pmcid
+    store = get_session_store()
+    for stored in store.list_for_session(session_id):
+        if stored.metadata.get("pmcid") == pmcid and stored.metadata.get("evidenceKind") not in {"abstract", "supplement"}:
+            return _document_result(stored, True)
+    try:
+        result = await literature.fetch_full_text(pmcid)
+    except ToolHttpError as error:
+        return {"ok": False, "status": "download_failed", "error": str(error),
+                "nextStep": "Try each Europe PMC PDF candidate with parse_pdf_url, then find_publication with the DOI and useFallback=true for Sci-Hub if not already attempted; offer upload if all fail."}
+    sections = result.pop("allSections")
+    document = ParsedDocument(markdown="\n\n".join(f"## {k}\n{v}" for k, v in sections.items()),
+                              sections=sections, parser="europepmc-jats")
+    stored = store.add_document(session_id, f"{pmcid}.xml", document, origin=result["url"],
+        metadata={"pmcid": pmcid, "title": result["title"], "source": "europepmc", "format": "xml", "rawPath": result["rawPath"],
+                  "sha256": result["sha256"], "identifiers": result["identifiers"],
+                  "license": result["license"], "supplementaryFiles": result["supplementaryFiles"]})
+    return _document_result(stored)
 
 
 async def _search_specification(args: dict, _session: str) -> Any:
@@ -76,46 +294,64 @@ async def _list_templates(args: dict, _session: str) -> Any:
 
 
 async def _get_template_columns(args: dict, _session: str) -> Any:
-    return await templates.get_template_columns(args["name"], args.get("version"))
+    return await templates.get_template_columns(args["name"], args.get("version"),
+                                                offset=args.get("offset", 0), limit=args.get("limit", 20))
 
 
 async def _validate_templates(args: dict, _session: str) -> Any:
     return await templates.validate_combination(
-        args.get("technology"), args.get("sample"), args.get("experiments") or []
+        args.get("technology"), args.get("sample"), args.get("experiments") or [], args.get("sampleMetadataTemplates") or []
     )
 
 
 async def _parse_pdf_url(args: dict, session_id: str) -> Any:
     url = args["url"]
-    parser = get_pdf_parser()
+    store = get_session_store()
+    identifiers = store.pdf_identifiers(session_id, url)
+    doi = literature.normalize_doi(identifiers.get("doi") or args.get("doi"))
+    if identifiers.get("doi") and args.get("doi") and doi != literature.normalize_doi(args["doi"]):
+        return {"ok": False, "status": "identifier_conflict", "error": "The supplied DOI conflicts with this discovered PDF. Use its original publication identifiers."}
+    for stored in store.list_for_session(session_id):
+        if stored.metadata.get("evidenceKind") in {"abstract", "supplement"}:
+            continue
+        if stored.origin == url or (doi and stored.metadata.get("doi") == doi
+                                    and stored.metadata.get("version") == args.get("version")):
+            if stored.origin == url:
+                for key, value in identifiers.items():
+                    if not stored.metadata.get(key):
+                        stored.metadata[key] = value
+            return _document_result(stored, True)
     try:
-        document = await parser.parse_url(url)
+        data, path = await cached_download(url, "pdf", trust_env=_pdf_trust_env(session_id, url))
+    except ToolHttpError as error:
+        return {"ok": False, "status": "download_failed", "error": str(error),
+                "nextStep": "Try the next PDF candidate. After Europe PMC candidates fail, call find_publication with the DOI and useFallback=true if not already attempted. After Sci-Hub fails, offer upload."}
+    try:
+        document = await get_pdf_parser().parse_bytes(data, "paper.pdf")
+        if not document.markdown.strip():
+            raise PdfParseError("PDF parser returned empty text.")
     except (PdfParseError, ToolHttpError) as error:
-        return {
-            "ok": False,
-            "error": str(error),
-            "nextStep": "Ask the user to upload the paper PDF through the assistant panel.",
-        }
-
-    stored = get_session_store().add_document(session_id, url.rsplit("/", 1)[-1] or "paper.pdf", document, origin=url)
-    return {
-        "ok": True,
-        "documentId": stored.document_id,
-        "parser": document.parser,
-        "charCount": document.char_count,
-        "availableSections": list(document.sections.keys()),
-        "nextStep": "Call read_document with this documentId to read specific sections.",
-    }
+        return {"ok": False, "status": "parse_failed", "error": str(error), "rawPath": path,
+                "nextStep": "The PDF is cached. Retry parsing after fixing the parser or try another candidate."}
+    stored = store.add_document(session_id, "paper.pdf", document, origin=url,
+        metadata={**identifiers, "source": url, "format": "pdf", "rawPath": path,
+                  "sha256": hashlib.sha256(data).hexdigest(), "doi": doi or None,
+                  "pmid": identifiers.get("pmid") or args.get("pmid"), "license": args.get("license"), "version": args.get("version")})
+    return _document_result(stored)
 
 
 async def _check_pdf_reachable(args: dict, _session: str) -> Any:
-    """Confirm a candidate PDF URL is downloadable before spending a parse."""
     try:
-        data, content_type = await get_bytes(args["url"], timeout=60.0, max_bytes=40 * 1024 * 1024)
+        data, _ = await cached_download(args["url"], "pdf", trust_env=_pdf_trust_env(_session, args["url"]))
     except ToolHttpError as error:
-        return {"reachable": False, "error": str(error)}
-    is_pdf = data[:5] == b"%PDF-" or "pdf" in content_type.lower()
-    return {"reachable": True, "isPdf": is_pdf, "bytes": len(data), "contentType": content_type}
+        return {"reachable": False, "isPdf": False, "error": str(error)}
+    return {"reachable": True, "isPdf": True, "bytes": len(data), "contentType": "application/pdf"}
+
+
+def _pdf_trust_env(session_id: str, url: str) -> bool:
+    if get_session_store().pdf_source(session_id, url) == "scihub":
+        return get_settings().scihub_trust_env
+    return True
 
 
 async def _list_documents(_args: dict, session_id: str) -> Any:
@@ -125,9 +361,11 @@ async def _list_documents(_args: dict, session_id: str) -> Any:
             {
                 "documentId": d.document_id,
                 "fileName": d.file_name,
-                "origin": d.origin,
-                "charCount": d.document.char_count,
-                "availableSections": list(d.document.sections.keys()),
+                **({"title": d.metadata["title"]} if d.metadata.get("title") else {}),
+                "availableSections": list(d.document.sections) or ["body"],
+                "identifiers": {key: d.metadata[key] for key in ("doi", "pmid", "pmcid") if d.metadata.get(key)},
+                "nextReads": [{"documentId": d.document_id, "sections": [name], "offset": offset}
+                              for name, offset in d.unread_sections().items()],
             }
             for d in stored
         ]
@@ -137,35 +375,69 @@ async def _list_documents(_args: dict, session_id: str) -> Any:
 async def _read_document(args: dict, session_id: str) -> Any:
     stored = get_session_store().get(args["documentId"])
     if not stored:
-        return {"ok": False, "error": "Unknown documentId - it may have expired. Ask the user to re-upload."}
+        return {
+            "ok": False, "status": "document_not_found",
+            "error": "Unknown documentId. Use the returned documentId, not a filename or publication accession.",
+            "availableDocuments": (await _list_documents({}, session_id))["documents"],
+            "nextStep": "Match the intended paper against availableDocuments and retry read_document with its exact documentId. "
+                        "If no matching document exists, call list_documents to refresh; then reacquire a public paper "
+                        "using get_publication_full_text or the publication PDF workflow. Ask for re-upload only "
+                        "when the missing document was user-provided and cannot otherwise be recovered. Do not guess an ID.",
+        }
     if stored.session_id != session_id:
         return {"ok": False, "error": "That document belongs to a different session."}
 
     wanted = args.get("sections")
-    limit = int(args.get("maxChars", 12000))
+    limit = args.get("maxChars", MAX_DOCUMENT_CHARS)
+    offset = args.get("offset", 0)
+    if type(limit) is not int or limit <= 0:
+        return {"ok": False, "error": "maxChars must be a positive integer."}
+    if type(offset) is not int or offset < 0:
+        return {"ok": False, "error": "offset must be a non-negative integer."}
+    limit = min(limit, MAX_DOCUMENT_CHARS)
     sections = stored.document.sections or {"body": stored.document.markdown}
+    if wanted is not None and (not isinstance(wanted, list) or not wanted or
+                               any(not isinstance(name, str) or not name.strip() for name in wanted)):
+        return {"ok": False, "error": "sections must be a non-empty array of chapter names."}
+    names = list(dict.fromkeys(name.strip().lower() for name in wanted)) if wanted else list(sections)
+    missing = [name for name in names if name not in sections]
+    selected = [name for name in names if name in sections]
+    if not selected:
+        return {"ok": False, "error": "Requested sections were not found.",
+                "missingSections": missing, "availableSections": list(sections)}
+    if offset and len(names) != 1:
+        return {"ok": False, "error": "Use offset with exactly one section. Follow a nextReads entry."}
+    if offset > len(sections[selected[0]]):
+        return {"ok": False, "error": "offset exceeds the section length.",
+                "totalChars": len(sections[selected[0]])}
 
-    if wanted:
-        picked = {name: text for name, text in sections.items() if name in {w.lower() for w in wanted}}
-        if not picked:
-            picked = sections
-    else:
-        picked = sections
+    def page(budget: int) -> dict:
+        output, info, next_reads = {}, {}, []
+        for name in selected:
+            text = sections[name]
+            chunk = text[offset:offset + budget]
+            end = offset + len(chunk)
+            budget -= len(chunk)
+            if chunk or offset == len(text):
+                output[name] = chunk
+            info[name] = {"offset": offset, "returnedChars": len(chunk), "totalChars": len(text),
+                          "truncated": end < len(text)}
+            if end < len(text):
+                next_reads.append({"documentId": stored.document_id, "sections": [name],
+                                   "offset": end, "maxChars": limit})
+        return {"ok": True, "documentId": stored.document_id, "fileName": stored.file_name,
+                "availableSections": list(sections), "sections": output, "sectionInfo": info,
+                "missingSections": missing, "truncated": bool(next_reads), "nextReads": next_reads}
 
-    budget = limit
-    output: dict[str, str] = {}
-    for name, text in picked.items():
-        if budget <= 0:
-            break
-        output[name] = text[:budget]
-        budget -= len(output[name])
-
-    return {
-        "ok": True,
-        "fileName": stored.file_name,
-        "availableSections": list(sections.keys()),
-        "sections": output,
-    }
+    result = page(limit)
+    # Escaped characters and metadata count towards the serialized tool budget.
+    # Rebuild a smaller page so continuation offsets always match returned text.
+    while len(json.dumps(result, ensure_ascii=False)) > MAX_RESULT_CHARS and limit > 1:
+        limit = max(1, limit // 2)
+        result = page(limit)
+    get_session_store().record_document_read(session_id, stored.document_id, result["sectionInfo"])
+    result["evidenceKind"] = stored.metadata.get("evidenceKind", "article")
+    return result
 
 
 # -------------------------------------------------------------------- summaries
@@ -181,15 +453,12 @@ def _join(items: list[Any], limit: int = 3) -> str:
     return f"{head}, …" if len(items) > limit else head
 
 
-def _summarize_dataset(result: dict) -> str:
-    files = result.get("files") or {}
+def _summarize_metadata(result: dict) -> str:
     parts: list[str] = [result.get("accession") or "PRIDE project"]
     if result.get("organisms"):
         parts.append(_join(result["organisms"], 2))
     if result.get("instruments"):
         parts.append(_join(result["instruments"], 2))
-    if files.get("rawFileCount"):
-        parts.append(f"{files['rawFileCount']} raw files")
     if result.get("references"):
         parts.append(f"{len(result['references'])} reference(s)")
     return " · ".join(part for part in parts if part)
@@ -204,20 +473,22 @@ def _summarize_raw_files(result: dict) -> str:
 
 def _summarize_publication(result: dict) -> str:
     if not result.get("found"):
-        return "No Europe PMC record matched"
+        return {"identifier_conflict": "PMID/DOI conflict — verification required",
+                "needs_confirmation": "Title match needs confirmation"}.get(result.get("status"), "No downloadable publication found")
     parts = [result.get("title") or "Untitled"]
     if result.get("journal"):
         parts.append(str(result["journal"]))
     parts.append("open full text" if result.get("fullTextAvailable") else "no open full text")
-    if result.get("pdfUrls"):
-        parts.append(f"{len(result['pdfUrls'])} PDF link(s)")
+    pdfs = result.get("pdfCandidates") or result.get("pdfUrls") or []
+    if pdfs:
+        parts.append(f"{len(pdfs)} PDF link(s)")
     return " · ".join(parts)
 
 
 def _summarize_full_text(result: dict) -> str:
-    sections = result.get("sections") or {}
-    chars = sum(len(text or "") for text in sections.values())
-    return f"{result.get('pmcid') or 'Article'} · {_join(list(sections), 4)} · {chars:,} chars"
+    if result.get("ok") is False:
+        return result.get("error") or "Full-text download failed"
+    return f"{result.get('pmcid') or 'Article'} · {_join(result.get('availableSections') or [], 4)} · {result.get('charCount', 0):,} chars"
 
 
 def _summarize_spec(result: dict) -> str:
@@ -281,7 +552,8 @@ def _summarize_template_columns(result: dict) -> str:
     columns = result.get("columns") or []
     return (
         f"{result.get('name')} ({result.get('layer') or 'unknown layer'}) · "
-        f"{len(required)} required of {len(columns)} columns"
+        f"{len(required)} required of {result.get('totalColumns', len(columns))} columns"
+        + (f" · showing {len(columns)}; next offset {result['nextOffset']}" if result.get("nextOffset") is not None else "")
     )
 
 
@@ -322,7 +594,10 @@ def _summarize_read_document(result: dict) -> str:
         return f"Could not read: {result.get('error') or 'unknown error'}"
     sections = result.get("sections") or {}
     chars = sum(len(text or "") for text in sections.values())
-    return f"{result.get('fileName')} · {_join(list(sections), 4)} · {chars:,} chars"
+    suffix = " · more available" if result.get("truncated") else ""
+    if result.get("missingSections"):
+        suffix += " · missing: " + _join(result["missingSections"], 4)
+    return f"{result.get('fileName')} · {_join(list(sections), 4)} · {chars:,} chars{suffix}"
 
 
 # ---------------------------------------------------------------------- schemas
@@ -330,10 +605,12 @@ def _summarize_read_document(result: dict) -> str:
 TOOLS: list[dict[str, Any]] = [
     {
         "declaration": {
-            "name": "get_pride_dataset",
+            "name": "get_pride_metadata",
             "description": (
-                "Fetch PRIDE Archive metadata and raw file names for a ProteomeXchange "
-                "accession. Always the first step when the user gives a PXD identifier."
+                "Fetch only PRIDE Archive project metadata and publication references for a "
+                "ProteomeXchange accession. Returns complete description, protocols and sample "
+                "attributes without truncation. Does not fetch raw files. Results are cached per session. "
+                "Call first for a PXD identifier only if its complete metadata is not already in context."
             ),
             "parameters": {
                 "type": "object",
@@ -341,35 +618,90 @@ TOOLS: list[dict[str, Any]] = [
                 "required": ["accession"],
             },
         },
-        "handler": _get_dataset,
+        "handler": _get_metadata,
+        # Protocol tails and sample attributes are evidence, not expendable previews.
+        "max_result_chars": None,
         "status": "Fetching PRIDE metadata",
-        "title": "PRIDE dataset",
-        "summarize": _summarize_dataset,
+        "title": "PRIDE metadata",
+        "summarize": _summarize_metadata,
     },
     {
         "declaration": {
             "name": "get_pride_raw_files",
-            "description": "Fetch only the raw/acquisition file names for a ProteomeXchange accession.",
+            "description": "Fetch all raw/acquisition file names and available URLs for a ProteomeXchange accession without truncation. Results are cached per session; call only if the full list is absent from context. Does not download file contents.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "accession": {"type": "string"},
-                    "limit": {"type": "integer", "description": "Max file names to return (default 400)."},
                 },
                 "required": ["accession"],
             },
         },
         "handler": _get_raw_files,
+        "max_result_chars": None,
         "status": "Listing raw files",
         "title": "PRIDE raw files",
         "summarize": _summarize_raw_files,
     },
     {
         "declaration": {
+            "name": "list_pride_technical_files",
+            "description": (
+                "Discover session-bound PRIDE evidence file IDs (mqpar.xml, mzTab, mzIdentML). "
+                "Call for missing or conflicting technical parameters on Instrument & Protocol, "
+                "an explicit user verification request, or an unresolved file-to-analysis mapping. "
+                "Skip when existing evidence already answers the question. Does not download files. "
+                "Prefer relevant mqpar/mzTab; mzIdentML is a slower fallback. Reuses session discovery."
+            ),
+            "parameters": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "accession": {"type": "string", "description": "Exact current PXD accession."},
+                    "reason": {"type": "string", "enum": sorted(pride_technical.REASONS)},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": 200, "description": "Use returned nextOffset for another catalogue page."},
+                },
+                "required": ["accession", "reason"],
+            },
+        },
+        "handler": pride_technical.discover,
+        "status": "Finding PRIDE technical evidence files", "title": "PRIDE technical files",
+        "summarize": lambda r: f"{r.get('accession')}: {r.get('status')} · {r.get('candidateCount', 0)} candidate files" + (" · cached" if r.get('cached') else ""),
+    },
+    {
+        "declaration": {
+            "name": "extract_pride_technical_metadata",
+            "description": (
+                "Read technical evidence from an exact fileId returned by list_pride_technical_files "
+                "for this session/project. No arbitrary URLs or local paths. Returns sourced, scoped facts "
+                "with warnings and pagination; follow nextOffset before concluding a modification list. "
+                "15 seconds / 8 MiB input / 32 MiB decoded per file; at most 3 distinct files per project/session. "
+                "Pages and repeated calls use the cached result, including partial/failed reads. "
+                "Partial/unavailable results are optional evidence, not a reason to stop the wizard. "
+                "Do not use these files to infer biological replicates or replace ontology verification."
+            ),
+            "parameters": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "accession": {"type": "string"},
+                    "fileId": {"type": "string", "description": "Exact discovered tech_… ID; never a filename or URL."},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": 2000, "description": "Fact offset; use returned nextOffset. Cached pages do not redownload."},
+                },
+                "required": ["accession", "fileId"],
+            },
+        },
+        "handler": pride_technical.extract,
+        "status": "Reading PRIDE technical metadata", "title": "Technical parameter evidence",
+        "summarize": lambda r: f"{r.get('fileName', r.get('accession', 'PRIDE'))}: {r.get('status')} · "
+                               f"{r.get('totalStoredFacts', 0)} facts · {r.get('stopReason') or 'see evidence'}" + (" · cached" if r.get('cached') else ""),
+    },
+    {
+        "declaration": {
             "name": "find_publication",
             "description": (
                 "Resolve a paper by PMID, DOI, or title through Europe PMC. Reports whether "
-                "open full text exists and which PDF URLs are available."
+                "open full text exists and which PDF URLs are available. Only after Europe PMC "
+                "XML/PDF sources fail, set useFallback=true with the resolved DOI to discover "
+                "a Sci-Hub PDF. Do not repeat a failed fallback; offer upload instead."
             ),
             "parameters": {
                 "type": "object",
@@ -377,6 +709,7 @@ TOOLS: list[dict[str, Any]] = [
                     "pmid": {"type": "string"},
                     "doi": {"type": "string"},
                     "title": {"type": "string"},
+                    "useFallback": {"type": "boolean", "description": "Default false. Set true only after primary XML/PDF sources fail; requires DOI."},
                 },
             },
         },
@@ -386,9 +719,29 @@ TOOLS: list[dict[str, Any]] = [
         "summarize": _summarize_publication,
     },
     {
+        "declaration": {"name": "get_publication_abstract",
+            "description": "Fetch a PMID abstract from PubMed independently of full-text XML. Returns a session document explicitly labelled abstract, not a full paper.",
+            "parameters": {"type": "object", "properties": {"pmid": {"type": "string"}}, "required": ["pmid"]}},
+        "handler": _get_abstract, "status": "Retrieving PubMed abstract", "title": "Publication abstract", "summarize": _summarize_full_text,
+    },
+    {
+        "declaration": {"name": "find_publication_supplements",
+            "description": "Discover supplementary files independently of XML/PDF availability via publisher, PMC, NCBI and optional PRIDE accession. Project files are candidates, not automatically paper supplements. Call even when fullTextAvailable=false. Returns source-specific statuses and real attachment URLs. Use before declaring sample design unavailable.",
+            "parameters": {"type": "object", "properties": {"pmid": {"type": "string"}, "doi": {"type": "string"}, "accession": {"type": "string"}}}},
+        "handler": _find_supplements, "status": "Finding supplementary materials", "title": "Supplement discovery",
+        "summarize": lambda r: f"{r.get('status', 'unknown')}: {len(r.get('candidates', []))} supplementary links",
+    },
+    {
+        "declaration": {"name": "get_publication_supplement",
+            "description": "Download a discovered attachment; ZIPs return a member listing, select member to parse. PDFs use MinerU, spreadsheets preserve sheet and row references, text/Word are parsed into session documents. Read returned documentId/nextReads for actual evidence. Use discovered URLs or actual user-supplied direct URLs with userProvided=true. Never invent URLs. User links have unverified paper identity.",
+            "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "userProvided": {"type": "boolean", "description": "True only for an attachment URL explicitly supplied by the user."}, "fileName": {"type": "string", "description": "Actual filename with extension for extensionless URLs."}, "member": {"type": "string", "description": "Exact ZIP member from the listing; omit to list archive."}}, "required": ["url"]}},
+        "handler": _get_supplement, "status": "Downloading and parsing supplementary material", "title": "Supplementary document",
+        "summarize": lambda r: f"{r.get('status', 'unknown')}: {r.get('fileName') or r.get('error') or str(len(r.get('members', []))) + ' archive members'}",
+    },
+    {
         "declaration": {
             "name": "get_publication_full_text",
-            "description": "Fetch cleaned Europe PMC full text sections for an open-access PMC article.",
+            "description": "Download Europe PMC JATS XML and store the complete article as a session document. Returns documentId for read_document. Prefer this when fullTextAvailable is true.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -396,7 +749,7 @@ TOOLS: list[dict[str, Any]] = [
                     "sections": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional subset, e.g. ['methods','results'].",
+                        "description": "Legacy option; the full article is stored. Use read_document to select sections.",
                     },
                 },
                 "required": ["pmcid"],
@@ -426,13 +779,18 @@ TOOLS: list[dict[str, Any]] = [
         "declaration": {
             "name": "parse_pdf_url",
             "description": (
-                "Download a PDF and parse it with MinerU. On setup, prefer asking the user to "
-                "upload via the paperclip instead of calling this. Use only when the user "
-                "explicitly asks to fetch a known free PDF URL."
+                "Download and validate a discovered PDF candidate, cache the original, and parse it "
+                "with MinerU into a session document. Use after XML is unavailable or fails. "
+                "Try alternate candidates on failure before asking for upload. "
+                "Pass PMID/DOI and license/version from discovery when available."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"url": {"type": "string"}},
+                "properties": {
+                    "url": {"type": "string"},
+                    "doi": {"type": "string"}, "pmid": {"type": "string"},
+                    "license": {"type": "string"}, "version": {"type": "string"},
+                },
                 "required": ["url"],
             },
         },
@@ -444,12 +802,12 @@ TOOLS: list[dict[str, Any]] = [
     {
         "declaration": {
             "name": "list_documents",
-            "description": "List papers the user has uploaded or that were parsed in this session.",
+            "description": "List available session documents with documentId, fileName, optional title, and availableSections. Includes uploads, pasted text, and retrieved articles. Use to discover documents; if documentId and sections are already known, call read_document directly.",
             "parameters": {"type": "object", "properties": {}},
         },
         "handler": _list_documents,
-        "status": "Checking uploaded documents",
-        "title": "Uploaded documents",
+        "status": "Checking available documents",
+        "title": "Available documents",
         "summarize": _summarize_documents,
     },
     {
@@ -457,14 +815,17 @@ TOOLS: list[dict[str, Any]] = [
             "name": "read_document",
             "description": (
                 "Read sections of a parsed document. Prefer sections ['methods','results'] for "
-                "SDRF annotation evidence."
+                "SDRF annotation evidence. Prefer one section per call. maxChars is a shared character "
+                "budget (default and maximum 12000), not a token count. Check missingSections and "
+                "sectionInfo; when truncated, use nextReads arguments to continue without skipping text."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "documentId": {"type": "string"},
+                    "documentId": {"type": "string", "description": "Exact opaque ID returned by list_documents, get_publication_full_text, or parse_pdf_url (e.g. doc_...). Never use fileName, PMCID, DOI, or a guessed ID. On failure refresh the session document list."},
                     "sections": {"type": "array", "items": {"type": "string"}},
-                    "maxChars": {"type": "integer"},
+                    "maxChars": {"type": "integer", "minimum": 1, "maximum": MAX_DOCUMENT_CHARS},
+                    "offset": {"type": "integer", "minimum": 0, "description": "Character offset within exactly one requested section; use nextReads to continue."},
                 },
                 "required": ["documentId"],
             },
@@ -618,10 +979,14 @@ TOOLS: list[dict[str, Any]] = [
     {
         "declaration": {
             "name": "get_template_columns",
-            "description": "Resolve a template's inherited column list with requirement levels.",
+            "description": "Read a page of inherited template columns and validation rules. When nextOffset is non-null, call again with that offset and the same name/version. Omit version to use the pinned catalogue version.",
             "parameters": {
                 "type": "object",
-                "properties": {"name": {"type": "string"}, "version": {"type": "string"}},
+                "properties": {
+                    "name": {"type": "string"}, "version": {"type": "string"},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
                 "required": ["name"],
             },
         },
@@ -633,13 +998,14 @@ TOOLS: list[dict[str, Any]] = [
     {
         "declaration": {
             "name": "validate_template_combination",
-            "description": "Validate a technology + sample + experiment template combination.",
+            "description": "Validate a template combination using the wizard snapshot and inherited rules.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "technology": {"type": "string"},
-                    "sample": {"type": "string"},
+                    "sample": {"type": ["string", "null"], "description": "Optional sample template; null for generic samples without a specialized template."},
                     "experiments": {"type": "array", "items": {"type": "string"}},
+                    "sampleMetadataTemplates": {"type": "array", "items": {"type": "string"}, "description": "Additional compatible sample-layer templates."},
                 },
             },
         },
@@ -722,6 +1088,8 @@ async def dispatch(name: str, raw_arguments: str | dict, session_id: str) -> str
         result = {"error": f"{type(error).__name__}: {error}"}
 
     payload = json.dumps(result, ensure_ascii=False, default=str)
-    if len(payload) > MAX_RESULT_CHARS:
-        payload = payload[:MAX_RESULT_CHARS] + '..."[truncated]"'
+    max_result_chars = tool.get("max_result_chars", MAX_RESULT_CHARS)
+    if max_result_chars is not None and len(payload) > max_result_chars:
+        payload = json.dumps({"ok": False, "error": "Tool result exceeds the output limit. Request fewer sections/items or a smaller maxChars.",
+                              "truncated": True, "originalChars": len(payload)}, ensure_ascii=False)
     return payload

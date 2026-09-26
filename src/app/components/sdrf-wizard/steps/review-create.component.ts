@@ -1,3 +1,5 @@
+import { protocolField, protocolChoiceForFile, protocolValueLabel } from '../../../core/utils/protocol-fields';
+import { TemplateService } from '../../../core/services/template.service';
 /**
  * Review & Create Component (Step 8)
  *
@@ -142,11 +144,19 @@ import {
           </div>
           <div class="config-item">
             <span class="config-label">Instrument:</span>
-            <span class="config-value">{{ state().instrument?.label || 'Not set' }}</span>
+            <span class="config-value">{{ protocolSummary('comment[instrument]') }}</span>
           </div>
           <div class="config-item">
             <span class="config-label">Enzyme:</span>
-            <span class="config-value">{{ state().cleavageAgent?.name || 'Not set' }}</span>
+            <span class="config-value">{{ protocolSummary('comment[cleavage agent details]') }}</span>
+          </div>
+          <div class="config-item">
+            <span class="config-label">Precursor mass tolerance:</span>
+            <span class="config-value">{{ protocolSummary('comment[precursor mass tolerance]') }}</span>
+          </div>
+          <div class="config-item">
+            <span class="config-label">Fragment mass tolerance:</span>
+            <span class="config-value">{{ protocolSummary('comment[fragment mass tolerance]') }}</span>
           </div>
         </div>
       </div>
@@ -189,7 +199,8 @@ import {
         </div>
       </div>
 
-      <!-- Spec validation summary -->
+      <!-- Snapshot validation summary -->
+      <p class="spec-note">Checks use the selected repository snapshot. Ontology and specialized validator checks requiring additional validation are listed below.</p>
       @if (needsEditorFollowUp()) {
         <div class="hint-message">
           Selected experiment/sample templates may require additional columns
@@ -199,7 +210,7 @@ import {
 
       <div class="spec-validation" [class.has-errors]="errorCount() > 0" [class.has-warnings]="warningCount() > 0 && errorCount() === 0" [class.ok]="validationDone() && errorCount() === 0 && warningCount() === 0">
         <div class="spec-validation-header">
-          <strong>SDRF validation</strong>
+          <strong>Template snapshot preflight</strong>
           @if (validationRunning()) {
             <span class="spec-status">Running…</span>
           } @else if (validationFailed()) {
@@ -578,6 +589,17 @@ export class ReviewCreateComponent {
   private readonly validator = inject(PyodideValidatorService);
 
   readonly state = this.wizardState.state;
+  protocolSummary(name: string): string {
+    const field = protocolField(this.state(), name);
+    const counts = new Map<string, number>();
+    for (const file of this.state().dataFiles) {
+      const choice = protocolChoiceForFile(field, file.fileName);
+      if (choice) counts.set(choice.id, (counts.get(choice.id) || 0) + 1);
+    }
+    return field.choices.filter(choice => counts.has(choice.id)).map(choice =>
+      protocolValueLabel(choice.value) + (counts.size > 1 ? ` (${counts.get(choice.id)} files)` : '')).join(' · ') || 'Not provided';
+  }
+
   readonly sdrfVersion = formatSdrfSemver(SDRF_SPEC_VERSION);
 
   readonly validationRunning = signal(false);
@@ -587,6 +609,9 @@ export class ReviewCreateComponent {
   readonly validationIssues = signal<ValidationError[]>([]);
 
   private lastValidatedKey = '';
+  private validationRequest = 0;
+
+  private readonly templateService = inject(TemplateService);
 
   readonly previewTable = computed(() => {
     try {
@@ -615,51 +640,16 @@ export class ReviewCreateComponent {
 
   readonly truncatedIssues = computed(() => this.validationIssues().length > 8);
 
-  readonly sampleTemplateLabel = computed(() => {
-    const id = getSampleTemplateId(this.state());
-    return WIZARD_TEMPLATES.find(t => t.id === id)?.name || id || 'Not selected';
-  });
-
-  readonly technologyTemplateLabel = computed(() => {
-    const id = this.state().technologyTemplate;
-    return WIZARD_TEMPLATES.find(t => t.id === id)?.name || id || 'Not selected';
-  });
-
-  readonly experimentTemplateLabel = computed(() => {
-    const ids = this.state().experimentTemplates || [];
-    if (ids.length === 0) return 'None';
-    return ids.map(id => WIZARD_TEMPLATES.find(t => t.id === id)?.name || id).join(', ');
-  });
-
-  readonly needsEditorFollowUp = computed(() => {
-    const sample = getSampleTemplateId(this.state());
-    const experiments = this.state().experimentTemplates || [];
-    const advancedSample = ['clinical-metadata', 'oncology-metadata', 'metaproteomics', 'human-gut', 'soil', 'water'].includes(sample || '');
-    const advancedExp = experiments.some(e =>
-      ['dia-acquisition', 'single-cell', 'immunopeptidomics', 'crosslinking', 'lc-ms-metabolomics', 'gc-ms-metabolomics'].includes(e)
-    );
-    return advancedSample || advancedExp;
-  });
-
-  readonly templateName = computed(() => {
-    const parts = [this.sampleTemplateLabel(), this.technologyTemplateLabel()];
-    const exp = this.experimentTemplateLabel();
-    if (exp !== 'None') parts.push(exp);
-    return parts.join(' + ');
-  });
-
-  readonly templateIcon = computed(() => {
-    const template = getSampleTemplateId(this.state());
-    switch (template) {
-      case 'human': return '\ud83e\uddd1';
-      case 'cell-line':
-      case 'cell-lines': return '\ud83e\uddeb';
-      case 'vertebrate':
-      case 'vertebrates': return '\ud83d\udc2d';
-      case 'plants': return '\ud83c\udf31';
-      default: return '?';
-    }
-  });
+  private layerLabel(layer: string): string {
+    return (this.state().selectedTemplates || []).filter(ref => this.templateService.getTemplateInfo(ref.name)?.layer === layer)
+      .map(ref => `${ref.name} v${ref.version}`).join(' + ') || 'None';
+  }
+  readonly sampleTemplateLabel = computed(() => this.layerLabel('sample'));
+  readonly technologyTemplateLabel = computed(() => this.layerLabel('technology'));
+  readonly experimentTemplateLabel = computed(() => this.layerLabel('experiment'));
+  readonly needsEditorFollowUp = computed(() => false);
+  readonly templateName = computed(() => (this.state().leafTemplateRefs || []).map(ref => `${ref.name} v${ref.version}`).join(' + '));
+  readonly templateIcon = computed(() => '📋');
 
   readonly labelConfigName = computed(() => {
     const s = this.state();
@@ -676,15 +666,16 @@ export class ReviewCreateComponent {
 
   readonly factorSummary = computed(() => {
     const factors = this.state().factors.filter(f => f.enabled && f.name.trim());
-    if (factors.length === 0) return 'None';
-    return factors.map(f => `factor value[${f.name}]`).join(', ');
+    if (this.state().factorDecision === 'none') return `None (explicit): ${this.state().noFactorReason}`;
+    if (factors.length === 0) return 'Not yet confirmed';
+    return factors.map(f => `factor value[${f.name}] (${f.scope === 'run' ? 'MS run' : 'sample'})`).join(', ');
   });
 
   constructor() {
     effect(() => {
       const table = this.previewTable();
       if (!table || !this.wizardState.isAllValid()) return;
-      const key = table.columns.map(c => c.name).join('|') + ':' + table.sampleCount;
+      const key = JSON.stringify([table.metadata?.templateSnapshotId, table.columns, table.sampleCount]);
       if (key !== this.lastValidatedKey) {
         this.lastValidatedKey = key;
         void this.runValidation();
@@ -694,35 +685,28 @@ export class ReviewCreateComponent {
 
   async runValidation(): Promise<void> {
     const table = this.previewTable();
-    if (!table || this.validationRunning()) return;
+    if (!table) return;
+    const request = ++this.validationRequest;
+    const key = JSON.stringify([table.metadata?.templateSnapshotId, table.columns, table.sampleCount]);
+    const isCurrent = () => request === this.validationRequest && key === JSON.stringify([this.previewTable()?.metadata?.templateSnapshotId, this.previewTable()?.columns, this.previewTable()?.sampleCount]);
 
     this.validationRunning.set(true);
+    this.validationDone.set(false);
+    this.validationIssues.set([]);
     this.validationFailed.set(false);
     this.validationErrorMessage.set('');
 
     try {
       const tsv = this.exporter.exportToTsv(table);
-      const sampleTemplate = getSampleTemplateId(this.state());
-      const templates = [
-        sampleTemplate,
-        this.state().technologyTemplate,
-        ...this.state().experimentTemplates,
-      ].filter((t): t is string => !!t);
+      const snapshotId = this.state().templateSnapshotId;
+      if (!snapshotId) throw new Error('Template snapshot is missing. Return to template selection.');
+      const errors = await this.templateService.validateTable(snapshotId, this.state().selectedTemplates || [], tsv);
 
-      const uniqueTemplates = [...new Set(templates)];
-      if (uniqueTemplates.length === 0) {
-        uniqueTemplates.push('ms-proteomics');
-      }
-
-      const errors = await this.validator.validate(tsv, uniqueTemplates, {
-        skipOntology: true,
-        mode: 'api',
-        allowApiFallback: false,
-      });
-
+      if (!isCurrent()) return;
       this.validationIssues.set(errors);
       this.validationDone.set(true);
     } catch (err) {
+      if (!isCurrent()) return;
       this.validationFailed.set(true);
       this.validationDone.set(false);
       this.validationIssues.set([]);
@@ -730,7 +714,7 @@ export class ReviewCreateComponent {
         err instanceof Error ? err.message : 'Validation service unavailable'
       );
     } finally {
-      this.validationRunning.set(false);
+      if (request === this.validationRequest) this.validationRunning.set(false);
     }
   }
 

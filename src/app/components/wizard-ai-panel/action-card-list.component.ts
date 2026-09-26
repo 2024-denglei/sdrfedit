@@ -21,11 +21,13 @@ interface CardGroup {
   pending: WizardActionCard[];
 }
 
-type LayerKind = 'technology' | 'sample' | 'experiment' | 'count' | 'description' | 'generic';
+type LayerKind = 'technology' | 'sample' | 'experiment' | 'count' | 'description' | 'attribute' | 'generic';
 
 const OP_LAYER: Record<string, LayerKind> = {
   setTechnologyTemplate: 'technology',
   setSampleTemplate: 'sample',
+  setSampleTemplates: 'sample',
+  applyCharacteristicDraft: 'attribute',
   setExperimentTemplates: 'experiment',
   setSampleCount: 'count',
   setExperimentDescription: 'description',
@@ -39,6 +41,7 @@ const LAYER_LABEL: Record<LayerKind, string> = {
   experiment: 'Experiment',
   count: 'Samples',
   description: 'Notes',
+  attribute: 'Sample attribute',
   generic: 'Suggestion',
 };
 
@@ -49,7 +52,7 @@ const LAYER_LABEL: Record<LayerKind, string> = {
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     @for (group of groups(); track group.step) {
-      <section class="group">
+      <section class="group" [attr.inert]="disabled() ? '' : null" [attr.aria-busy]="disabled()">
         <header class="group-head">
           <span class="step-pill">
             <span class="step-num">{{ group.stepIndex + 1 }}</span>
@@ -80,6 +83,15 @@ const LAYER_LABEL: Record<LayerKind, string> = {
               <code>{{ preview(card) }}</code>
             </div>
 
+            @if (card.replacesCardId) {
+              <p class="state">Repair for {{ card.replacesCardId }}</p>
+            }
+            @if (card.executionState === 'rolled-back') {
+              <p class="state">Rolled back because another card failed. Original recommendation retained.</p>
+            } @else if (card.executionState === 'not-executed') {
+              <p class="state">Not executed: waiting for the failed card to be repaired.</p>
+            }
+
             @if (card.action.reasoning) {
               <p class="card-why">
                 <span class="why-label">Why</span>
@@ -103,6 +115,9 @@ const LAYER_LABEL: Record<LayerKind, string> = {
               </div>
             }
 
+            @if (importDependency(card); as dependency) {
+              <p class="state failed">{{ dependency }}</p>
+            }
             <footer class="card-foot">
               <button
                 class="jump"
@@ -119,11 +134,15 @@ const LAYER_LABEL: Record<LayerKind, string> = {
               >
                 Ask
               </button>
-              @if (card.status === 'pending') {
+              @if (card.executionState === 'superseded') {
+                <span class="state dismissed">Replaced by {{ card.replacedByCardId }}</span>
+              } @else if (card.executionState === 'repair-rejected') {
+                <span class="state failed">Repair not applied: {{ card.error }}</span>
+              } @else if (card.status === 'pending') {
                 <button class="dismiss" (click)="dismiss.emit(card)">Dismiss</button>
-                <button class="apply" (click)="apply.emit(card)">Apply</button>
+                <button class="apply" [disabled]="!!importDependency(card)" (click)="apply.emit(card)">Apply</button>
               } @else if (card.status === 'applied') {
-                <span class="state applied">Applied</span>
+                <span class="state applied">{{ card.autoApplied ? 'Auto-applied' : 'Applied' }}</span>
                 <button class="apply secondary" (click)="apply.emit(card)" title="Apply this suggestion again">
                   Re-apply
                 </button>
@@ -132,7 +151,7 @@ const LAYER_LABEL: Record<LayerKind, string> = {
                 <button class="apply secondary" (click)="apply.emit(card)">Apply</button>
               } @else {
                 <span class="state failed" [title]="card.error || ''">{{ card.error || 'Could not apply' }}</span>
-                <button class="apply secondary" (click)="apply.emit(card)">Retry</button>
+                <button class="apply secondary" (click)="apply.emit(card)">Ask AI to fix</button>
               }
             </footer>
           </article>
@@ -141,7 +160,9 @@ const LAYER_LABEL: Record<LayerKind, string> = {
     }
   `,
   styles: [`
-    .group { margin-top: 12px; }
+    :host { display: block; min-width: 0; overflow-wrap: anywhere; }
+    .group { margin-top: 12px; min-width: 0; }
+    .card-why > span:last-child { min-width: 0; white-space: pre-wrap; }
 
     .group-head {
       display: flex;
@@ -331,6 +352,7 @@ const LAYER_LABEL: Record<LayerKind, string> = {
 
     .card-foot {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       gap: 8px;
       margin-top: 10px;
@@ -400,11 +422,15 @@ const LAYER_LABEL: Record<LayerKind, string> = {
     }
     .state.applied { color: #15803d; }
     .state.dismissed { color: #94a3b8; }
-    .state.failed { color: #b91c1c; font-weight: 500; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .state.failed { color: #b91c1c; font-weight: 500; min-width: 0; white-space: pre-wrap; }
+    .card-foot .state.failed { flex-basis: 100%; }
+    .card-foot button { flex-shrink: 0; white-space: nowrap; }
+    .apply:disabled { opacity: .5; cursor: not-allowed; }
   `],
 })
 export class ActionCardListComponent {
   readonly cards = input<WizardActionCard[]>([]);
+  readonly disabled = input(false);
 
   readonly apply = output<WizardActionCard>();
   readonly dismiss = output<WizardActionCard>();
@@ -414,6 +440,16 @@ export class ActionCardListComponent {
 
   private readonly bridge = inject(WizardAiBridgeService);
   private readonly wizardState = inject(WizardStateService);
+
+  importDependency(card: WizardActionCard): string {
+    if (card.action.op !== 'applyRunsFilesPlan' || card.status !== 'pending') return '';
+    const plan = card.action.args[0] as { groups?: { files?: { fileName?: string }[] }[] } | undefined;
+    if (!Array.isArray(plan?.groups)) return '';
+    const known = new Set(this.wizardState.state().dataFiles.map(f => f.fileName.trim()));
+    const missing = new Set(plan.groups.flatMap(group => Array.isArray(group?.files) ? group.files : [])
+      .map(file => file?.fileName?.trim()).filter((name): name is string => !!name && !known.has(name)));
+    return missing.size ? `Import ${missing.size} missing file name(s) first. Apply the file-pool import card before this plan, or import names in Runs & Files.` : '';
+  }
 
   readonly groups = computed<CardGroup[]>(() => {
     const byStep = new Map<string, CardGroup>();
@@ -449,6 +485,15 @@ export class ActionCardListComponent {
 
   /** Pending cards re-read the live state, so the diff stays honest as it changes. */
   preview(card: WizardActionCard): string {
+    // Older saved cards contain shortened previews; recover full lists from
+    // the preserved arguments without changing their applied/dismissed state.
+    if (['setSourceNames', 'setBiologicalReplicates', 'replaceWithUnassignedFileNames',
+         'assignDataFilesToRun', 'assignFilesToRunsByName', 'setFactorColumnValues'].includes(card.action.op)) {
+      return this.bridge.previewAction(card.action);
+    }
+    if (card.status !== 'pending' && card.action.op === 'setExperimentDescription') {
+      return `Set experiment description:\n${String(card.action.args[0] ?? '')}`;
+    }
     return card.status === 'pending' ? this.bridge.previewAction(card.action) : card.preview;
   }
 

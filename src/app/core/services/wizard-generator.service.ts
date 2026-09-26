@@ -1,14 +1,22 @@
+import { PROTOCOL_COLUMNS, protocolChoiceForFile, protocolOutputValue } from '../utils/protocol-fields';
 /**
  * Wizard Generator Service
  *
  * Converts WizardState into an SdrfTable structure.
  */
 
+import { templateFieldValue } from '../utils/template-fields';
+import { normalizeMassTolerance } from '../utils/mass-tolerance';
+
 import { Injectable, inject } from '@angular/core';
 import {
   WizardState,
+  assayNameForFile,
   WizardModification,
   WizardFactor,
+  factorCandidates,
+  resolveFactorValue,
+  resolveRunFactorValue,
   DynamicColumnDefault,
   WizardExpansionRow,
   WizardSampleEntry,
@@ -141,10 +149,7 @@ export class WizardGeneratorService {
     for (const meta of charCols) {
       const lower = meta.name.toLowerCase();
       if (emitted.has(lower)) continue;
-      if (meta.requirement === 'recommended' && !this.hasCharacteristicOutputValue(state, meta.name)) {
-        continue;
-      }
-      if (meta.requirement !== 'required' && meta.requirement !== 'recommended') {
+      if (meta.requirement !== 'required' && !this.hasCharacteristicOutputValue(state, meta.name)) {
         continue;
       }
       table.columns.push(this.createDynamicCharacteristicColumn(state, meta.name, columnPosition++));
@@ -158,6 +163,15 @@ export class WizardGeneratorService {
       if (isWizardSkippedCharacteristic(colDefault.columnName)) continue;
       table.columns.push(this.createDynamicCharacteristicColumn(state, colDefault.columnName, columnPosition++));
       emitted.add(colDefault.columnName.toLowerCase());
+    }
+
+    // Linked factor sources must be emitted even when they are optional characteristics.
+    for (const factor of state.factors.filter(f => f.enabled && f.sourceCharacteristic)) {
+      const source = factor.sourceCharacteristic!;
+      if (!emitted.has(source.toLowerCase())) {
+        table.columns.push(this.createDynamicCharacteristicColumn(state, source, columnPosition++));
+        emitted.add(source.toLowerCase());
+      }
     }
 
     // Biological replicate
@@ -176,6 +190,19 @@ export class WizardGeneratorService {
     // Instrument & Protocol
     table.columns.push(this.createInstrumentColumn(state, columnPosition++));
     table.columns.push(this.createCleavageAgentColumn(state, columnPosition++));
+
+    // Recommended search parameters: omit unfilled columns, preserve explicit unknowns.
+    for (const [name, tolerance] of [
+      ['precursor mass tolerance', state.precursorMassTolerance],
+      ['fragment mass tolerance', state.fragmentMassTolerance],
+    ]) {
+      if (!tolerance?.trim()) continue;
+      table.columns.push({
+        name: `comment[${name}]`, type: 'comment',
+        value: normalizeMassTolerance(tolerance), modifiers: [],
+        columnPosition: columnPosition++, isRequired: false,
+      });
+    }
 
     // Modifications
     for (const mod of state.modifications) {
@@ -197,6 +224,10 @@ export class WizardGeneratorService {
       table.columns.push(this.createFactorColumn(state, factor, columnPosition++));
     }
 
+    if (state.templateSnapshotId) this.applyEffectiveSchema(table, state);
+    this.applyProtocolAssignments(table, state);
+    const accession = state.projectAccession?.match(/^PXD\d+$/i)?.[0]?.toUpperCase();
+    if (accession) table.metadata = { ...table.metadata, filename: `${accession}.sdrf.tsv` };
     return table;
   }
 
@@ -413,19 +444,7 @@ export class WizardGeneratorService {
   }
 
   private createAssayNameColumn(state: WizardState, position: number): SdrfColumn {
-    const { value, modifiers } = this.modsFromRows(row => {
-      const parts = [row.sourceName];
-      if (row.fractionId > 1 || this.expansionRows.some(r => r.fractionId > 1)) {
-        parts.push(`F${row.fractionId}`);
-      }
-      if (row.technicalReplicate > 1 || this.expansionRows.some(r => r.technicalReplicate > 1)) {
-        parts.push(`R${row.technicalReplicate}`);
-      }
-      if (row.label && row.label !== 'label free sample') {
-        parts.push(row.label.replace(/\s+/g, ''));
-      }
-      return parts.join('_');
-    });
+    const { value, modifiers } = this.modsFromRows(row => assayNameForFile(row.fileName));
     return {
       name: 'assay name',
       type: 'comment',
@@ -566,7 +585,7 @@ export class WizardGeneratorService {
   }
 
   private createDataFileColumn(state: WizardState, position: number): SdrfColumn {
-    const { value, modifiers } = this.modsFromRows(r => r.fileName);
+    const { value, modifiers } = this.modsFromRows(r => r.downloadUrl || r.fileName);
     return {
       name: 'comment[data file]',
       type: 'comment',
@@ -589,29 +608,72 @@ export class WizardGeneratorService {
   }
 
   private createSdrfTemplateColumns(state: WizardState, startPosition: number): SdrfColumn[] {
-    const leaves = this.templateService.getLeafTemplateIds({
-      technologyTemplate: state.technologyTemplate,
-      sampleTemplate: getSampleTemplateId(state),
-      experimentTemplates: state.experimentTemplates || [],
-    });
+    const refs = state.leafTemplateRefs || [];
+    return refs.map((ref, i) => ({
+      name: 'comment[sdrf template]', type: 'comment' as ColumnType,
+      value: `${ref.name} ${formatSdrfSemver(ref.version)}`,
+      modifiers: [], columnPosition: startPosition + i,
+    }));
+  }
 
-    if (leaves.length === 0) {
-      leaves.push('ms-proteomics');
+  private applyEffectiveSchema(table: SdrfTable, state: WizardState): void {
+    if (!state.effectiveColumns?.length || !state.leafTemplateRefs?.length) {
+      throw new Error('Resolve the selected template snapshot before generating SDRF.');
     }
+    const existing = table.columns;
+    const columns: SdrfColumn[] = [];
+    for (const definition of state.effectiveColumns) {
+      const explicit = state.dynamicTemplateValues?.[definition.name];
+      const defaultValue = templateFieldValue(state, definition);
+      let adapted = existing.filter(c => c.name === definition.name);
+      // Technology type is governed by the template enum, never by the legacy MS default.
+      if (definition.name === 'technology type') adapted = [];
+      if (definition.name === 'comment[instrument]' && !state.instrument) adapted = [];
+      if (definition.name === 'comment[cleavage agent details]' && !state.cleavageAgent) adapted = [];
+      if (explicit !== undefined || !adapted.length) {
+        if (defaultValue || definition.requirement === 'required') {
+          columns.push({ name: definition.name,
+            type: definition.name.startsWith('characteristics[') ? 'characteristics' : definition.name === 'source name' ? 'source_name' : 'comment',
+            value: defaultValue, modifiers: [], columnPosition: 0,
+            isRequired: definition.requirement === 'required' });
+        }
+      } else {
+        for (const column of adapted) {
+          columns.push({ ...column, isRequired: definition.requirement === 'required',
+            value: column.value === 'not available' && defaultValue ? defaultValue : column.value });
+        }
+      }
+    }
+    columns.push(...existing.filter(c => c.type === 'factor_value'));
+    const priority = (c: SdrfColumn) => c.type === 'source_name' ? 0 : c.type === 'characteristics' ? 1 : c.name === 'assay name' ? 2 : c.name === 'technology type' ? 3 : c.type === 'factor_value' ? 5 : 4;
+    columns.sort((a, b) => priority(a) - priority(b));
+    table.columns = columns.map((column, columnPosition) => ({ ...column, columnPosition }));
+    table.metadata = { ...table.metadata, templateSnapshotId: state.templateSnapshotId,
+      templateRefs: state.leafTemplateRefs };
+  }
 
-    return leaves.map((name, i) => {
-      const version = formatSdrfSemver(
-        this.templateService.getTemplateVersion(name) || SDRF_SPEC_VERSION
-      );
-      return {
-        name: 'comment[sdrf template]',
-        type: 'comment' as ColumnType,
-        // Spec preferred simple format: "template_name vX.Y.Z"
-        value: `${name} ${version}`,
-        modifiers: [],
-        columnPosition: startPosition + i,
-      };
-    });
+  /** Expand raw-file assignments to every SDRF channel row belonging to that file. */
+  private applyProtocolAssignments(table: SdrfTable, state: WizardState): void {
+    for (const [name, field] of Object.entries(state.protocolFields || {})) {
+      const definition = state.effectiveColumns?.find(c => c.name === name);
+      if (state.templateSnapshotId && !definition) continue;
+      const used = this.expansionRows.map(row => protocolChoiceForFile(field, row.fileName)?.value);
+      const hasValue = used.some(value => value !== undefined);
+      const existingIndex = table.columns.findIndex(column => column.name === name);
+      const insertionIndex = existingIndex < 0 ? table.columns.length : existingIndex;
+      table.columns = table.columns.filter(column => column.name !== name);
+      if (!hasValue && definition?.requirement !== 'required') continue;
+      const count = name === PROTOCOL_COLUMNS.modifications
+        ? Math.max(1, ...used.map(value => Array.isArray(value) ? value.length : 0)) : 1;
+      const columns: SdrfColumn[] = Array.from({ length: count }, (_, index) => ({
+        name, type: 'comment',
+        ...this.modsFromRows(row => protocolOutputValue(state, name, row.fileName, index)),
+        columnPosition: 0, isRequired: definition?.requirement === 'required',
+        ...(name === PROTOCOL_COLUMNS.instrument ? { ontologyType: 'ms' as const } : {}),
+      }));
+      table.columns.splice(insertionIndex, 0, ...columns);
+    }
+    table.columns.forEach((column, index) => { column.columnPosition = index; });
   }
 
   private createFactorColumn(
@@ -619,12 +681,13 @@ export class WizardGeneratorService {
     factor: WizardFactor,
     position: number
   ): SdrfColumn {
-    const name = `factor value[${factor.name.trim()}]`;
-    const candidates = factor.values || [];
-    const defaultValue = candidates[0] || 'not available';
+    const name = `factor value[${factor.name.trim().toLowerCase()}]`;
+    const candidates = factorCandidates(state, factor);
+    const defaultValue = candidates.length === 1 ? candidates[0] : 'not available';
     const modifiers = this.modsFromRows(row => {
+      if (factor.scope === 'run') return resolveRunFactorValue(state.msRuns.find(run => run.id === row.runId), factor) || 'not available';
       const sample = this.findSample(state, row.sampleIndex);
-      return sample?.factorValues?.[factor.name]?.trim() || defaultValue;
+      return sample ? resolveFactorValue(state, sample, factor) || 'not available' : 'not available';
     }, defaultValue).modifiers;
 
     return {
@@ -707,6 +770,7 @@ export class WizardGeneratorService {
       const sample = this.findSample(state, row.sampleIndex);
       const override = sample?.customCharacteristics?.[columnName]?.trim();
       const fromChoices = sample?.characteristicValues?.[columnName]?.trim();
+      if (sample?.characteristicValues?.[columnName] === '') return 'not available';
       return override || fromChoices || defaultValue;
     }, defaultValue);
 
